@@ -35,16 +35,16 @@ MODEL_MAP = {
 @router.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
-
-    print("\n===== Incoming Request =====")
-    print(body)
+    logger.debug(body)
+    start_time = time.perf_counter()
+    logger.info("→ %s", request.url.path)
 
     messages = body.get("messages", [])
 
     # Resolve model alias before session check so the session
     # records the real model name, not the alias.
     requested_model = body.get("model", "proxy")
-    resolved_model = MODEL_MAP.get(requested_model, MODEL)
+    resolved_model = MODEL_MAP.get(requested_model, requested_model)
     body["model"] = resolved_model
 
     # Detect OpenCode's internal title generation requests.
@@ -102,7 +102,9 @@ async def chat(request: Request):
 
     response = await client.send(provider_request, stream=True)
 
-    print(f"{PROVIDER_NAME} -> {response.status_code} ({response.headers.get('content-type')})")
+    elapsed = (time.perf_counter() - start_time) * 1000
+
+    logger.info("← %d (%.0f ms)", response.status_code, elapsed)
 
     if response.status_code != 200:
         text = await response.aread()
