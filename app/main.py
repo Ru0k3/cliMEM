@@ -1,37 +1,39 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 
-from .filter import get_chat_log
+from .filter import get_chat_log, process_session
 from .proxy import router
-from .storage import end_session, init_database
+from .storage import close_database, end_session, get_current_session, init_database
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Runs once when the server starts and once when it stops.
-    """
-
     init_database()
 
     yield
 
-    end_session()
+    print("\nSaving session...\n")
+
+    process_session(
+        get_chat_log(),
+        str(Path.cwd()),
+        get_current_session(),
+    )
+
+    end_session("normal_shutdown")
+    close_database()
 
 
-app = FastAPI(
-    lifespan=lifespan,
-)
+app = FastAPI(lifespan=lifespan)
 
 app.include_router(router)
 
 
 @app.get("/")
 async def health():
-    return {
-        "message": "server is alive",
-    }
+    return {"message": "server is alive"}
 
 
 @app.get("/chat-log")
