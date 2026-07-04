@@ -77,3 +77,32 @@ dist/
 
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+
+# Runtime data
+.climem/
+.cognee/
+
+# Local configs
+openspec/config.yaml
+
+# Local helper scripts
+test.sh
+test_script.sh
+test_verify.sh
+
+# Internal documentation
+PROJECT_AUDIT.md
+FUNCTIONAL_INVENTORY.md
+
+# Internal docs
+PROJECT_AUDIT.md
+FUNCTIONAL_INVENTORY.md
+
+# OpenSpec local config
+openspec/config.yaml
+
+# OpenCode local commands
+.opencode/
