@@ -10,10 +10,10 @@ Scope (locked):
 Entry point (frozen signature — do not change):
     process_session(chat_log, working_directory, session_name) -> list[dict]
 
-Output contract (locked):
+Output contract (updated):
 
     {
-        "category": "decision" | "state" | "convention" | "open_thread",
+        "category": "decision" | "state" | "convention" | "open_thread" | "architecture" | "api" | "implementation" | "database" | "identity" | "goal",
         "text": "<atomic, self-contained, pronoun-free sentence>",
     }
 
@@ -272,34 +272,301 @@ def _is_dead_end_or_reverted(window: list[Exchange], idx: int) -> bool:
 
 # ─── Category cue phrases ──────────────────────────────────────────────────────
 
-_DECISION_CUES = re.compile(
-    r"\b(decided to|decided on|going with|we'll use|we will use|"
-    r"chose|choosing|opted for|settled on|the plan is to)\b",
-    re.IGNORECASE,
-)
+# Priority Order:
+# 1. Identity (highest specificity)
+# 2. Convention
+# 3. Decision
+# 4. Goal
+# 5. Open Thread
+# 6. Architecture
+# 7. API
+# 8. Database
+# 9. Implementation (file/module mentions)
+# 10. State (generic "is/now" -- lowest specificity)
 
-_STATE_CUES = re.compile(
-    r"\b(currently|is now|exists at|is located at|is stored in|"
-    r"contains|the schema (has|includes)|the file .* (has|contains)|"
-    r"is implemented (as|in)|lives in|is defined in)\b",
-    re.IGNORECASE,
-)
-
-_CONVENTION_CUES = re.compile(
-    r"\b(should be named|always name|never use|prefer to|"
-    r"naming convention|style rule|must follow|going forward|"
-    r"from now on|the convention is)\b",
-    re.IGNORECASE,
-)
-
-_OPEN_THREAD_CUES = re.compile(
-    r"\b(todo|to-do|unresolved|still need to|not yet (decided|implemented)|"
-    r"known bug|known issue|pending|need to figure out|unclear (whether|how))\b",
-    re.IGNORECASE,
-)
+CUE_PATTERNS = {
+    "identity": re.compile(
+        r"\b("
+        r"project name is|"
+        r"next project name is|"
+        r"repo name is|"
+        r"repository name is|"
+        r"called|"
+        r"named"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "convention": re.compile(
+        r"\b("
+        r"should be named|"
+        r"must be named|"
+        r"always name|"
+        r"never name|"
+        r"always use|"
+        r"never use|"
+        r"don't use|"
+        r"do not use|"
+        r"prefer(?:\s+to)?|"
+        r"recommended|"
+        r"best practice|"
+        r"convention|"
+        r"naming convention|"
+        r"style rule|"
+        r"coding standard|"
+        r"must follow|"
+        r"should follow|"
+        r"going forward|"
+        r"from now on|"
+        r"hereafter|"
+        r"keep using|"
+        r"continue using|"
+        r"all files should|"
+        r"every file should|"
+        r"every function should|"
+        r"all functions should|"
+        r"always call|"
+        r"always inject|"
+        r"always store|"
+        r"always return|"
+        r"always validate|"
+        r"always strip|"
+        r"must always|"
+        r"should always|"
+        r"must never|"
+        r"should never"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "decision": re.compile(
+        r"\b("
+        r"decided(?:\s+to|\s+on)?|"
+        r"decision(?:\s+was)?|"
+        r"going with|"
+        r"we(?:'ll| will)? use|"
+        r"we(?:'ll| will)? keep|"
+        r"we(?:'ll| will)? stick with|"
+        r"we(?:'ll| will)? switch to|"
+        r"we(?:'ll| will)? migrate to|"
+        r"we(?:'ll| will)? move to|"
+        r"we(?:'ll| will)? adopt|"
+        r"we(?:'ll| will)? implement|"
+        r"we(?:'ll| will)? store|"
+        r"we(?:'ll| will)? save|"
+        r"we(?:'ll| will)? inject|"
+        r"we(?:'ll| will)? call|"
+        r"we(?:'ll| will)? expose|"
+        r"we(?:'ll| will)? create|"
+        r"we(?:'ll| will)? remove|"
+        r"we(?:'ll| will)? rename|"
+        r"we(?:'ll| will)? refactor|"
+        r"chose|"
+        r"choosing|"
+        r"choice(?:\s+is)?|"
+        r"opted(?:\s+for)?|"
+        r"settled(?:\s+on)?|"
+        r"selected|"
+        r"picked|"
+        r"preferred?|"
+        r"standardized on|"
+        r"committed to|"
+        r"agreed(?:\s+to|\s+on)?|"
+        r"the plan is to|"
+        r"the approach is|"
+        r"the solution is|"
+        r"the fix is|"
+        r"the design is|"
+        r"the architecture is|"
+        r"instead of|"
+        r"rather than|"
+        r"replace(?:d)? with|"
+        r"swap(?:ped)? to|"
+        r"use(?:d)? instead|"
+        r"keep using|"
+        r"continue using"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "goal": re.compile(
+        r"\b("
+        r"I want to|"
+        r"I'm going to|"
+        r"I plan to|"
+        r"trying to|"
+        r"learning|"
+        r"studying|"
+        r"goal is|"
+        r"objective is"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "open_thread": re.compile(
+        r"\b("
+        r"todo|"
+        r"to-do|"
+        r"fixme|"
+        r"xxx|"
+        r"hack|"
+        r"temporary|"
+        r"workaround|"
+        r"unresolved|"
+        r"still need to|"
+        r"need to|"
+        r"needs to|"
+        r"remaining|"
+        r"left to do|"
+        r"follow[- ]?up|"
+        r"future work|"
+        r"not yet(?:\s+implemented|\s+decided|\s+finished)?|"
+        r"pending|"
+        r"known bug|"
+        r"known issue|"
+        r"bug|"
+        r"issue|"
+        r"edge case|"
+        r"fails when|"
+        r"doesn't work|"
+        r"does not work|"
+        r"broken|"
+        r"missing|"
+        r"incomplete|"
+        r"blocked by|"
+        r"waiting for|"
+        r"need to investigate|"
+        r"need to verify|"
+        r"need to figure out|"
+        r"unclear(?:\s+whether|\s+how)?|"
+        r"unknown|"
+        r"question is|"
+        r"haven't decided|"
+        r"haven't implemented|"
+        r"hasn't been done"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "architecture": re.compile(
+        r"\b("
+        r"architecture|design|pipeline|workflow|"
+        r"request flow|response flow|proxy|wrapper|"
+        r"middleware|hook|lifecycle|startup|shutdown|"
+        r"dependency injection|session lifecycle|"
+        r"data flow|control flow"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "api": re.compile(
+        r"\b("
+        r"endpoint|route|api|request|response|"
+        r"payload|body|json|header|status code|"
+        r"GET|POST|PUT|PATCH|DELETE|"
+        r"/v1/|http://|https://"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "database": re.compile(
+        r"\b("
+        r"sqlite|postgres|database|schema|table|"
+        r"column|row|index|migration|dataset|"
+        r"cognee|vector|embedding|knowledge graph|"
+        r"remember|recall|forget|improve"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "implementation": re.compile(
+        r"\b("
+        r"file|module|package|directory|folder|"
+        r"class|function|method|variable|"
+        r"app\.|main\.py|memory\.py|proxy\.py|"
+        r"filter\.py|config\.py|session\.py|"
+        r"README|\.env"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "state": re.compile(
+        r"\b("
+        r"currently|"
+        r"now|"
+        r"today|"
+        r"is now|"
+        r"exists(?:\s+at)?|"
+        r"is located at|"
+        r"lives in|"
+        r"resides in|"
+        r"is stored in|"
+        r"is saved in|"
+        r"is cached in|"
+        r"is persisted in|"
+        r"is indexed by|"
+        r"is backed by|"
+        r"is implemented(?:\s+as|\s+in)?|"
+        r"is defined in|"
+        r"is declared in|"
+        r"is exposed at|"
+        r"is available at|"
+        r"is handled by|"
+        r"is managed by|"
+        r"is called from|"
+        r"is invoked by|"
+        r"is generated by|"
+        r"is created by|"
+        r"contains|"
+        r"includes|"
+        r"consists of|"
+        r"uses|"
+        r"depends on|"
+        r"relies on|"
+        r"runs on|"
+        r"listens on|"
+        r"maps to|"
+        r"points to|"
+        r"returns|"
+        r"accepts|"
+        r"expects|"
+        r"supports|"
+        r"tracks|"
+        r"stores|"
+        r"loads|"
+        r"reads from|"
+        r"writes to|"
+        r"the schema(?:\s+has|\s+includes)?|"
+        r"the database(?:\s+has|\s+contains)?|"
+        r"the table(?:\s+has|\s+contains)?|"
+        r"the endpoint(?:\s+is)?|"
+        r"the route(?:\s+is)?|"
+        r"the file .*?(?:contains|has|defines)|"
+        r"the function .*?(?:returns|accepts|calls)|"
+        r"the class .*?(?:contains|implements)"
+        r")\b",
+        re.IGNORECASE,
+    ),
+}
 
 _RESOLVED_CUES = re.compile(
-    r"\b(fixed|resolved|figured out|solved|no longer an issue)\b",
+    r"\b("
+    r"fixed|"
+    r"resolved|"
+    r"solved|"
+    r"completed|"
+    r"implemented|"
+    r"finished|"
+    r"done|"
+    r"working|"
+    r"verified|"
+    r"confirmed|"
+    r"validated|"
+    r"addressed|"
+    r"patched|"
+    r"merged|"
+    r"closed|"
+    r"removed|"
+    r"eliminated|"
+    r"cleaned up|"
+    r"refactored|"
+    r"figured out|"
+    r"no longer(?:\s+an)? issue|"
+    r"works now|"
+    r"passes|"
+    r"successfully"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -330,17 +597,13 @@ def _has_dangling_pronoun(sentence: str) -> bool:
 
 
 def _categorize_sentence(sentence: str) -> str | None:
-    """Return a category for a sentence, or None if it matches no cue."""
-    if _DECISION_CUES.search(sentence):
-        return "decision"
-    if _CONVENTION_CUES.search(sentence):
-        return "convention"
-    if _OPEN_THREAD_CUES.search(sentence) and not _RESOLVED_CUES.search(sentence):
-        return "open_thread"
-    if _STATE_CUES.search(sentence):
-        return "state"
-    return None
+    for category, pattern in CUE_PATTERNS.items():
+        if pattern.search(sentence):
+            if category == "open_thread" and _RESOLVED_CUES.search(sentence):
+                continue
+            return category
 
+    return None
 
 # ─── Self-containment repair ───────────────────────────────────────────────────
 
@@ -456,7 +719,7 @@ def process_session(chat_log: str, working_directory: str, session_name: str) ->
     list[dict] — each dict:
 
     {
-        "category": "decision" | "state" | "convention" | "open_thread",
+        "category": "decision" | "state" | "convention" | "open_thread" | "architecture" | "api" | "implementation" | "database" | "identity" | "goal",
         "text": str,
     }
 
@@ -494,7 +757,7 @@ def process_session(chat_log: str, working_directory: str, session_name: str) ->
 
             repaired = _make_self_contained(sentence, topic_subject)
             if repaired is None:
-                continue  # dangling pronoun we couldn't safely fix — drop # dangling pronoun we couldn't safely fix — drop
+                continue  # dangling pronoun we couldn't safely fix — drop
 
             # Strip any remaining relative-time language
             repaired = re.sub(
@@ -531,7 +794,7 @@ if __name__ == "__main__":
     for f in facts:
         by_category.setdefault(f["category"], []).append(f["text"])
 
-    for cat in ("decision", "state", "convention", "open_thread"):
+    for cat in ("decision", "state", "convention", "open_thread", "architecture", "api", "implementation", "database", "identity", "goal"):
         items = by_category.get(cat, [])
         print(f"\n[{cat}] ({len(items)})")
         for t in items:
