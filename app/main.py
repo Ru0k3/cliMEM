@@ -1,54 +1,33 @@
 from contextlib import asynccontextmanager
-from pathlib import Path
-from .session import save_current_session
+
 from fastapi import FastAPI
 
-from .filter import (
-    get_chat_log,
-    process_session,
-    clear_chat_log,
-)
-
+from .filter import get_chat_log
+from .memory import ensure_cognee_connection
 from .proxy import router
-from .storage import close_database, end_session, get_current_session, init_database
+from .session import save_current_session
+from .storage import close_database, init_database
 
-from .memory import (
-    get_dataset_name,
-    store_memory,
-    improve_memory,
-)
-
-from .memory import (
-    get_dataset_name,
-    store_memory,
-    improve_memory,
-    ensure_cognee_connection,   # add this
-)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await ensure_cognee_connection()   # add this — must run before init_database()
+    # Local mode: returns immediately.
+    # Cloud mode: verifies the Cognee connection once at startup.
+    await ensure_cognee_connection()
+
+    # Initialize SQLite session database.
     init_database()
 
-    yield
+    try:
+        yield
+    finally:
+        print("\nSaving session...\n")
 
-    print("\nSaving session...\n")
+        # Save the current session before shutting down.
+        await save_current_session("normal_shutdown")
 
-    await save_current_session("normal_shutdown")
-
-    close_database()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_database()
-
-    yield
-
-    print("\nSaving session...\n")
-
-    await save_current_session("normal_shutdown")
-
-    close_database()
+        # Always close the database.
+        close_database()
 
 
 app = FastAPI(lifespan=lifespan)
