@@ -19,7 +19,7 @@ from .storage import (
 )
 
 CHECK_INTERVAL_SECONDS = 60
-IDLE_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
+IDLE_TIMEOUT_SECONDS = 10  # 30 minutes
 
 
 async def idle_watcher():

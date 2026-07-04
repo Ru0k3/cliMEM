@@ -482,7 +482,9 @@ def process_session(chat_log: str, working_directory: str, session_name: str) ->
 
         topic_subject = _derive_topic_subject(ex.user)
 
-        for sentence in _split_sentences(ex.assistant):
+        candidate_sentences = _split_sentences(ex.user) + _split_sentences(ex.assistant)
+
+        for sentence in candidate_sentences:
             if len(sentence.split()) < 6:
                 continue  # too short to be a standalone fact
 
@@ -492,7 +494,7 @@ def process_session(chat_log: str, working_directory: str, session_name: str) ->
 
             repaired = _make_self_contained(sentence, topic_subject)
             if repaired is None:
-                continue  # dangling pronoun we couldn't safely fix — drop
+                continue  # dangling pronoun we couldn't safely fix — drop # dangling pronoun we couldn't safely fix — drop
 
             # Strip any remaining relative-time language
             repaired = re.sub(
