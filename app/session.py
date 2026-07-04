@@ -3,7 +3,57 @@ from pathlib import Path
 from .filter import clear_chat_log, get_chat_log, process_session
 from .memory import get_dataset_name, improve_memory, store_memory
 from .storage import end_session, get_current_session
+from .storage import end_session, get_current_session, mark_activity as _mark_activity
+import time
 
+_last_activity: float | None = None
+
+import asyncio
+from datetime import datetime
+
+from .storage import (
+    end_session,
+    get_current_session,
+    get_last_activity,
+    mark_activity,
+)
+
+CHECK_INTERVAL_SECONDS = 60
+IDLE_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
+
+
+async def idle_watcher():
+    while True:
+        try:
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+            if get_current_session() is None:
+                continue
+
+            last_activity = get_last_activity()
+            if last_activity is None:
+                continue
+
+            idle_for = (datetime.now() - last_activity).total_seconds()
+
+            if idle_for >= IDLE_TIMEOUT_SECONDS:
+                print(f"✓ Idle for {int(idle_for)}s, ending session")
+                await save_current_session("idle_timeout")
+
+        except asyncio.CancelledError:
+            break
+
+
+def mark_activity():
+    _mark_activity()
+def mark_activity() -> None:
+    """Record the timestamp of the most recent user activity."""
+    global _last_activity
+    _last_activity = time.time()
+
+
+def get_last_activity() -> float | None:
+    return _last_activity
 
 async def save_current_session(reason: str):
     messages = get_chat_log()

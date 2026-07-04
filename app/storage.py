@@ -13,6 +13,7 @@ _cli_tool = None
 _provider_name = None
 _model = None
 _api_key_fingerprint = None
+_last_activity = None
 
 
 def init_database():
@@ -129,7 +130,13 @@ def close_database():
 
 def get_current_session():
     return _session_name
+def mark_activity():
+    global _last_activity
+    _last_activity = datetime.now()
 
+
+def get_last_activity():
+    return _last_activity
 
 def get_recent_sessions(limit=5):
     if connection is None:
