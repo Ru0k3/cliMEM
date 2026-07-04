@@ -12,15 +12,19 @@ Plus the proxy contract function:
     inject_memory(body, working_directory) -> dict
 
 CONTRACT WITH MEMBER 3:
-    facts passed to store_memory() are plain strings, already prefixed with
-    their category tag, e.g.:
-        "[decision] We chose FastAPI for the backend."
-        "[state] Auth is broken on Android."
-        "[convention] All endpoints use snake_case."
-        "[open_thread] Still undecided on deployment target."
-    store_memory() stores them exactly as given — it does NOT re-parse or
-    strip tags. Confirm the exact prefix format with Member 3 before either
-    of you build, so nobody double-prefixes or silently drops a tag.
+    facts passed to store_memory() are dictionaries in the form:
+
+        {
+            "category": "decision" | "state" | "convention" | "open_thread",
+            "text": "<atomic, self-contained sentence>",
+        }
+
+    store_memory() formats each fact internally as:
+
+        "[category] text"
+
+    before storing it in Cognee. Member 3 should not prefix category tags
+    manually.
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ from typing import Iterable
 import cognee
 from cognee.modules.search.types.SearchType import SearchType
 
+from .filetree import build_file_tree
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # 1. Dataset naming
@@ -60,15 +66,34 @@ def get_dataset_name(working_directory: str) -> str:
 # 2. store_memory
 # ---------------------------------------------------------------------------
 
-async def store_memory(facts: Iterable[str], dataset_name: str) -> None:
+async def store_memory(facts: Iterable[dict], dataset_name: str) -> None:
     """
     Store distilled, categorized fact sentences into Cognee, scoped to
     dataset_name. Builds the knowledge graph over them via cognify().
 
-    facts: Member 3's output — self-contained sentences, not raw chat logs
-           and not code. Category-tagged strings like "[decision] ...".
+    facts: Iterable of dictionaries produced by filter.process_session():
+
+       {
+           "category": "...",
+           "text": "..."
+       }
+
+       Raw chat logs and code blocks must already have been removed.
     """
-    fact_list = [f.strip() for f in facts if f and f.strip()]
+    fact_list = []
+
+    for fact in facts:
+        if not fact:
+            continue
+
+        category = fact.get("category", "").strip()
+        text = fact.get("text", "").strip()
+
+        if not category or not text:
+            continue
+
+        fact_list.append(f"[{category}] {text}")
+
     if not fact_list:
         return
 
@@ -176,35 +201,45 @@ _SYSTEM_PREFIX = (
     "Use it if relevant, but always prioritize the current conversation:\n\n"
 )
 
-_RECALL_QUERY = (
-    "What prior decisions, state, conventions, and open threads are "
-    "relevant to this project?"
+_FILETREE_PREFIX = (
+    "\n\nCurrent project structure:\n\n"
 )
 
 
 async def inject_memory(body: dict, working_directory: str) -> dict:
     """
-    Called ONCE per new session from the MEMBER 2 HOOK in proxy.py, right
-    before the request is forwarded. Do NOT call this on every turn —
-    only on session start to avoid unnecessary latency and Groq API calls.
+    Called for every incoming chat completion request from proxy.py,
+    immediately before the request is forwarded to the AI provider.
 
-    Retrieves relevant memory for the project and inserts it as a system
-    message at the front of body["messages"]. If the client already sent a
-    system message, the memory is APPENDED to it rather than overwriting it,
-    so any client-provided system prompt is preserved.
+    Retrieves relevant memory for the current project and injects it as a
+    system message at the front of body["messages"]. If the client already
+    provided a system message, the remembered context is appended to it
+    rather than replacing it, preserving the client's original instructions.
 
-    Returns the modified body. Everything else in body is untouched.
+    Returns the modified request body. All other fields remain unchanged.
     """
     dataset_name = get_dataset_name(working_directory)
-    memory_text = await search_memory(_RECALL_QUERY, dataset_name)
 
-    if not memory_text:
-        # No memory for this project yet — return body unchanged.
-        return body
+    messages = body.get("messages", [])
+
+    query = "Project context"
+
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            query = message.get("content", "").strip()
+            break
+
+    project_tree = build_file_tree(Path(working_directory))
+    memory_text = await search_memory(query, dataset_name)
+
+    content = _FILETREE_PREFIX + project_tree
+
+    if memory_text:
+        content = _SYSTEM_PREFIX + memory_text + content
 
     memory_message = {
         "role": "system",
-        "content": _SYSTEM_PREFIX + memory_text,
+        "content": content,
     }
 
     messages = list(body.get("messages", []))

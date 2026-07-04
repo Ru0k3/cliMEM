@@ -41,7 +41,7 @@ def init_database():
     print(f"✓ Database: {DATABASE}")
 
 
-def _start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint):
+def start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint):
     global _session_name, _working_directory, _cli_tool
     global _provider_name, _model, _api_key_fingerprint
 
@@ -73,8 +73,8 @@ def _start_session(working_directory, cli_tool, provider_name, model, api_key_fi
 
 def ensure_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint):
     if _session_name is None:
-        _start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint)
-        return
+        start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint)
+        return None
 
     reason = None
 
@@ -90,9 +90,9 @@ def ensure_session(working_directory, cli_tool, provider_name, model, api_key_fi
         reason = "api_key_changed"
 
     if reason:
-        end_session(reason)
-        _start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint)
-
+        return reason
+    
+    return None
 
 def end_session(ended_reason="normal_shutdown"):
     global _session_name, _working_directory, _cli_tool
