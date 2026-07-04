@@ -17,7 +17,10 @@ from .config import (
 )
 from .filter import add_message
 from .memory import inject_memory
-from .session import save_current_session
+from .session import (
+    save_current_session,
+    mark_activity,
+)
 from .storage import (
     ensure_session,
     get_current_session,
@@ -81,6 +84,7 @@ async def chat(request: Request):
             last = messages[-1]
             if last.get("role") == "user":
                 add_message("user", last.get("content", ""))
+                mark_activity()
 
         # Inject project memory only for real user conversations.
         body = await inject_memory(

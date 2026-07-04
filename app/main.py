@@ -7,7 +7,11 @@ from .memory import ensure_cognee_connection
 from .proxy import router
 from .session import save_current_session
 from .storage import close_database, init_database
-
+import asyncio
+from .session import (
+    idle_watcher,
+    save_current_session,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -15,18 +19,25 @@ async def lifespan(app: FastAPI):
     # Cloud mode: verifies the Cognee connection once at startup.
     await ensure_cognee_connection()
 
-    # Initialize SQLite session database.
     init_database()
+
+    watcher_task = asyncio.create_task(
+        idle_watcher()
+    )
 
     try:
         yield
+
     finally:
+
+        watcher_task.cancel()
+
         print("\nSaving session...\n")
 
-        # Save the current session before shutting down.
-        await save_current_session("normal_shutdown")
+        await save_current_session(
+            "normal_shutdown"
+        )
 
-        # Always close the database.
         close_database()
 
 
