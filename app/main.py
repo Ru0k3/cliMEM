@@ -18,6 +18,26 @@ from .memory import (
     improve_memory,
 )
 
+from .memory import (
+    get_dataset_name,
+    store_memory,
+    improve_memory,
+    ensure_cognee_connection,   # add this
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await ensure_cognee_connection()   # add this — must run before init_database()
+    init_database()
+
+    yield
+
+    print("\nSaving session...\n")
+
+    await save_current_session("normal_shutdown")
+
+    close_database()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()

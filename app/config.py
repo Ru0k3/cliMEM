@@ -21,6 +21,10 @@ MODEL_MAP = {
     "nemotron": os.getenv("MODEL_NEMOTRON", ""),
 }
 
+COGNEE_MODE = os.getenv("COGNEE_MODE", "local").lower()
+COGNEE_SERVICE_URL = os.getenv("COGNEE_SERVICE_URL", "")
+COGNEE_API_KEY = os.getenv("COGNEE_API_KEY", "")
+
 API_KEY_FINGERPRINT = hashlib.sha256(
     PROVIDER_API_KEY.encode("utf-8")
 ).hexdigest()

@@ -36,7 +36,7 @@ def cmd_restore(agent):
 
 
 def cmd_forget(yes: bool):
-    from app.memory import forget_memory, get_dataset_name
+    from app.memory import forget_memory, get_dataset_name, ensure_cognee_connection
 
     working_directory = str(Path.cwd())
     dataset_name = get_dataset_name(working_directory)
@@ -50,9 +50,12 @@ def cmd_forget(yes: bool):
             print("Aborted.")
             return
 
-    asyncio.run(forget_memory(dataset_name))
-    print(f"✓ Memory forgotten for {working_directory}")
+    async def _run():
+        await ensure_cognee_connection()
+        await forget_memory(dataset_name)
 
+    asyncio.run(_run())
+    print(f"✓ Memory forgotten for {working_directory}")
 
 def cmd_history(limit: int):
     init_database()

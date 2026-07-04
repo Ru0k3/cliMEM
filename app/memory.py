@@ -40,6 +40,34 @@ from .filetree import build_file_tree
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# 0. Cloud connection (optional)
+#    Called once at startup. If COGNEE_MODE=cloud, routes all subsequent
+#    cognee.add/recall/improve/forget calls to Cognee Cloud instead of the
+#    local embedded databases. Safe to call multiple times — no-ops after
+#    the first successful connection.
+# ---------------------------------------------------------------------------
+
+from .config import COGNEE_MODE, COGNEE_SERVICE_URL, COGNEE_API_KEY
+
+_cloud_connected = False
+
+
+async def ensure_cognee_connection() -> None:
+    global _cloud_connected
+
+    if _cloud_connected or COGNEE_MODE != "cloud":
+        return
+
+    if not COGNEE_SERVICE_URL or not COGNEE_API_KEY:
+        raise RuntimeError(
+            "COGNEE_MODE=cloud but COGNEE_SERVICE_URL or COGNEE_API_KEY is missing in .env"
+        )
+
+    await cognee.serve(url=COGNEE_SERVICE_URL, api_key=COGNEE_API_KEY)
+    _cloud_connected = True
+    print(f"[VERIFY] Connected to Cognee Cloud: {COGNEE_SERVICE_URL}")
+
+# ---------------------------------------------------------------------------
 # 1. Dataset naming
 #    Must be deterministic — same working_directory always produces the same
 #    string. This is the single mechanism for project isolation. Never inline
@@ -110,13 +138,38 @@ async def search_memory(query: str, dataset_name: str) -> str:
     Query Cognee scoped to dataset_name and return plain text ready to inject
     into a system message.
 
-    Uses GRAPH_COMPLETION so Cognee synthesizes an answer from the whole
-    graph rather than doing exact keyword matching — this is what makes
-    recall work even when the query wording differs from what was stored.
-
+    Two-stage: first probe with a lightweight search type to check relevance,
+    then only run GRAPH_COMPLETION synthesis if the probe found something.
     Returns "" if nothing relevant is found. Callers treat "" as
     "no memory to inject", not an error.
     """
+    probe_type = None
+    for candidate in ("CHUNKS", "INSIGHTS", "RAG_COMPLETION", "VECTOR"):
+        if hasattr(SearchType, candidate):
+            probe_type = getattr(SearchType, candidate)
+            break
+
+    if probe_type is not None:
+        try:
+            probe = await cognee.recall(
+                query_text=query,
+                query_type=probe_type,
+                datasets=[dataset_name],
+                only_context=True,
+            )
+        except Exception as e:
+            print(f"[DEBUG] probe exception: {e!r}")
+            probe = None
+
+        print(f"[DEBUG] probe_type={probe_type} probe={probe!r}")
+
+        if not probe:
+            return ""
+
+        probe_text = " ".join(getattr(item, "text", "") or "" for item in probe)
+        if not _is_probably_relevant(query, probe_text):
+            return ""
+
     try:
         results = await cognee.recall(
             query_text=query,
@@ -124,16 +177,27 @@ async def search_memory(query: str, dataset_name: str) -> str:
             datasets=[dataset_name],
             only_context=True,
         )
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] graph_completion exception: {e!r}")
         return ""
 
     return _flatten_results(results)
 
+def _is_probably_relevant(query: str, probe_text: str) -> bool:
+    """
+    Crude fallback relevance check: since this Cognee version exposes no
+    usable score data, require some lexical/word overlap between the query
+    and the retrieved chunk before trusting it enough to run GRAPH_COMPLETION.
+    """
+    query_words = {w.lower() for w in re.findall(r"[a-zA-Z]{4,}", query)}
+    text_words = {w.lower() for w in re.findall(r"[a-zA-Z]{4,}", probe_text)}
+    overlap = query_words & text_words
+    return len(overlap) >= 1
 
 def _flatten_results(results) -> str:
     """
-    Normalize whatever Cognee returns (ResponseGraphEntry objects, dicts, or
-    plain strings) into a single clean prose string with no duplicate lines.
+    Extract clean node-content sentences from Cognee's GRAPH_COMPLETION text
+    output, stripping graph structure markers (Nodes:, Connections:, etc.)
     """
     if not results:
         return ""
@@ -142,17 +206,33 @@ def _flatten_results(results) -> str:
     pieces: list[str] = []
 
     for item in results:
-        if isinstance(item, str):
-            text = item.strip()
-        elif isinstance(item, dict):
-            text = (item.get("text") or item.get("content") or "").strip()
-        else:
-            # ResponseGraphEntry-style object (what your test run returned)
-            text = (getattr(item, "text", None) or "").strip()
+        text = getattr(item, "text", None) if not isinstance(item, (str, dict)) else None
+        if text is None:
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+            else:
+                text = ""
 
-        if text and text not in seen:
-            seen.add(text)
-            pieces.append(text)
+        matches = re.findall(
+            r"__node_content_start__\n(.*?)\n__node_content_end__",
+            text,
+            flags=re.DOTALL,
+        )
+
+        for match in matches:
+            match = match.strip()
+            if not match or match == "None" or match in seen:
+                continue
+            seen.add(match)
+            pieces.append(match)
+
+        if not matches:
+            plain = text.strip()
+            if plain and plain not in seen and "Nodes:" not in plain:
+                seen.add(plain)
+                pieces.append(plain)
 
     return "\n".join(pieces)
 
@@ -219,6 +299,7 @@ async def inject_memory(body: dict, working_directory: str) -> dict:
     Returns the modified request body. All other fields remain unchanged.
     """
     dataset_name = get_dataset_name(working_directory)
+    print(f"[VERIFY] Dataset: {dataset_name}")
 
     messages = body.get("messages", [])
 
@@ -228,6 +309,7 @@ async def inject_memory(body: dict, working_directory: str) -> dict:
         if message.get("role") == "user":
             query = message.get("content", "").strip()
             break
+    print(f"[VERIFY] Recall query: {query}")
 
     project_tree = build_file_tree(Path(working_directory))
     memory_text = await search_memory(query, dataset_name)
