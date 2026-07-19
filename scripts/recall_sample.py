@@ -1,13 +1,13 @@
 import asyncio
-from pathlib import Path
 
 import cognee
 
 from app.memory import get_dataset_name
+from app.utils import get_cwd
 
 
 async def main():
-    dataset_name = get_dataset_name(str(Path.cwd()))
+    dataset_name = get_dataset_name(str(get_cwd()))
 
     print(f"Dataset: {dataset_name}")
 

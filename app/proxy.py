@@ -1,7 +1,6 @@
 import json
 import logging
 import time
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Request
@@ -18,14 +17,13 @@ from .config import (
 from .filter import add_message
 from .memory import inject_memory
 from .session import (
-    save_current_session,
-    mark_activity,
-)
-from .storage import (
     ensure_session,
     get_current_session,
+    mark_activity,
+    save_current_session,
     start_session,
 )
+from .utils import get_cwd
 
 router = APIRouter()
 logger = logging.getLogger("climem")
@@ -62,7 +60,7 @@ async def chat(request: Request):
 
         # Ensure a session exists and rotate if anything changed.
         rotation_reason = ensure_session(
-            working_directory=str(Path.cwd()),
+            working_directory=str(get_cwd()),
             cli_tool=CLI_TOOL,
             provider_name=PROVIDER_NAME,
             model=resolved_model,
@@ -73,7 +71,7 @@ async def chat(request: Request):
             await save_current_session(rotation_reason)
 
             start_session(
-                working_directory=str(Path.cwd()),
+                working_directory=str(get_cwd()),
                 cli_tool=CLI_TOOL,
                 provider_name=PROVIDER_NAME,
                 model=resolved_model,
@@ -89,7 +87,7 @@ async def chat(request: Request):
         # Inject project memory only for real user conversations.
         body = await inject_memory(
             body,
-            str(Path.cwd()),
+            str(get_cwd()),
         )
 
     headers = {

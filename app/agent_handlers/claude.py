@@ -1,38 +1,17 @@
-import json
-import shutil
 from pathlib import Path
 
+from ._utils import backup_config, read_json_config, restore_config, write_json_config
 
-def configure(config_path: Path, base_url: str):
+
+def configure(config_path: Path, base_url: str) -> None:
     """Configure Claude Code to use CliMEM."""
-
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if config_path.exists():
-        backup_path = config_path.with_suffix(".json.bak")
-
-        if not backup_path.exists():
-            shutil.copy2(config_path, backup_path)
-
-        with config_path.open("r", encoding="utf-8") as f:
-            config = json.load(f)
-    else:
-        config = {}
-
+    backup_config(config_path)
+    config = read_json_config(config_path)
     config.setdefault("env", {})
     config["env"]["ANTHROPIC_BASE_URL"] = base_url
-
-    with config_path.open("w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
+    write_json_config(config_path, config)
 
 
-def restore(config_path: Path):
+def restore(config_path: Path) -> None:
     """Restore the original Claude Code configuration."""
-
-    backup_path = config_path.with_suffix(".json.bak")
-
-    if not backup_path.exists():
-        raise FileNotFoundError("Backup configuration not found.")
-
-    shutil.copy2(backup_path, config_path)
+    restore_config(config_path)

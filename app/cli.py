@@ -1,12 +1,12 @@
 import argparse
 import asyncio
-from pathlib import Path
 
 import uvicorn
 
 from app.agents import AGENTS, CLIMEM_BASE_URL
 from app.agent_handlers import HANDLERS
 from app.storage import get_recent_sessions, init_database, close_database
+from app.utils import get_cwd
 
 
 def cmd_start():
@@ -35,10 +35,18 @@ def cmd_restore(agent):
     print(f"✓ {info['name']} restored.")
 
 
-def cmd_forget(yes: bool):
-    from app.memory import forget_memory, get_dataset_name, ensure_cognee_connection
+async def _forget_task(dataset_name: str) -> None:
+    """Async helper to run the forget workflow."""
+    from app.memory import ensure_cognee_connection, forget_memory
 
-    working_directory = str(Path.cwd())
+    await ensure_cognee_connection()
+    await forget_memory(dataset_name)
+
+
+def cmd_forget(yes: bool):
+    from app.memory import get_dataset_name
+
+    working_directory = str(get_cwd())
     dataset_name = get_dataset_name(working_directory)
 
     if not yes:
@@ -50,11 +58,7 @@ def cmd_forget(yes: bool):
             print("Aborted.")
             return
 
-    async def _run():
-        await ensure_cognee_connection()
-        await forget_memory(dataset_name)
-
-    asyncio.run(_run())
+    asyncio.run(_forget_task(dataset_name))
     print(f"✓ Memory forgotten for {working_directory}")
 
 def cmd_history(limit: int):

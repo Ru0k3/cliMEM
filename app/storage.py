@@ -1,3 +1,11 @@
+"""storage.py — Pure SQLite persistence layer for sessions.
+
+This module owns the database connection and provides low-level CRUD
+operations.  It holds NO in-memory session state — that lives in
+session.py.  This separation keeps session lifecycle logic and
+persistence decoupled.
+"""
+
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -7,16 +15,9 @@ DATABASE = APP_DIR / "sessions.db"
 
 connection = None
 
-_session_name = None
-_working_directory = None
-_cli_tool = None
-_provider_name = None
-_model = None
-_api_key_fingerprint = None
-_last_activity = None
 
-
-def init_database():
+def init_database() -> None:
+    """Create the database directory and tables if they don't exist."""
     global connection
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,85 +43,53 @@ def init_database():
     print(f"✓ Database: {DATABASE}")
 
 
-def start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint):
-    global _session_name, _working_directory, _cli_tool
-    global _provider_name, _model, _api_key_fingerprint
-
-    _session_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _working_directory = working_directory
-    _cli_tool = cli_tool
-    _provider_name = provider_name
-    _model = model
-    _api_key_fingerprint = api_key_fingerprint
-
+def insert_session(
+    session_name: str,
+    working_directory: str,
+    cli_tool: str,
+    provider_name: str,
+    model: str,
+    api_key_fingerprint: str,
+    started_at: str,
+) -> None:
+    """Insert a new session row."""
     cursor = connection.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT INTO sessions (
             session_name, working_directory, cli_tool,
             provider_name, model, api_key_fingerprint, started_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        _session_name, working_directory, cli_tool,
-        provider_name, model, api_key_fingerprint,
-        datetime.now().isoformat(),
-    ))
+    """,
+        (
+            session_name,
+            working_directory,
+            cli_tool,
+            provider_name,
+            model,
+            api_key_fingerprint,
+            started_at,
+        ),
+    )
     connection.commit()
 
-    print(f"✓ Session started : {_session_name}")
-    print(f"✓ Project         : {working_directory}")
-    print(f"✓ Provider        : {provider_name}")
-    print(f"✓ Model           : {model}")
 
-
-def ensure_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint):
-    if _session_name is None:
-        start_session(working_directory, cli_tool, provider_name, model, api_key_fingerprint)
-        return None
-
-    reason = None
-
-    if working_directory != _working_directory:
-        reason = "working_directory_changed"
-    elif cli_tool != _cli_tool:
-        reason = "cli_tool_changed"
-    elif provider_name != _provider_name:
-        reason = "provider_changed"
-    elif model != _model:
-        reason = "model_changed"
-    elif api_key_fingerprint != _api_key_fingerprint:
-        reason = "api_key_changed"
-
-    if reason:
-        return reason
-    
-    return None
-
-def end_session(ended_reason="normal_shutdown"):
-    global _session_name, _working_directory, _cli_tool
-    global _provider_name, _model, _api_key_fingerprint
-
-    if connection is None or _session_name is None:
-        return
-
+def update_session_end(session_name: str, ended_at: str, ended_reason: str) -> None:
+    """Record the end time and reason for a session."""
     cursor = connection.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         UPDATE sessions
         SET ended_at = ?, ended_reason = ?
         WHERE session_name = ?
-    """, (datetime.now().isoformat(), ended_reason, _session_name))
+    """,
+        (ended_at, ended_reason, session_name),
+    )
     connection.commit()
 
-    print(f"✓ Session ended : {_session_name} ({ended_reason})")
 
-    _session_name = None
-    _working_directory = None
-    _cli_tool = None
-    _provider_name = None
-    _model = None
-    _api_key_fingerprint = None
-
-
-def close_database():
+def close_database() -> None:
+    """Close the database connection if open."""
     global connection
 
     if connection is not None:
@@ -128,27 +97,21 @@ def close_database():
         connection = None
 
 
-def get_current_session():
-    return _session_name
-def mark_activity():
-    global _last_activity
-    _last_activity = datetime.now()
-
-
-def get_last_activity():
-    return _last_activity
-
-def get_recent_sessions(limit=5):
+def get_recent_sessions(limit: int = 5) -> list[tuple]:
+    """Return the most recent session rows, newest first."""
     if connection is None:
         return []
 
     cursor = connection.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT session_name, working_directory, cli_tool,
                provider_name, model, started_at, ended_at, ended_reason
         FROM sessions
         ORDER BY started_at DESC
         LIMIT ?
-    """, (limit,))
+    """,
+        (limit,),
+    )
 
     return cursor.fetchall()

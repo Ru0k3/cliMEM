@@ -1,10 +1,10 @@
 import asyncio
 import sys
-from pathlib import Path
-from app.memory import ensure_cognee_connection
+
 import cognee
 
-from app.memory import get_dataset_name
+from app.memory import ensure_cognee_connection, get_dataset_name
+from app.utils import get_cwd
 
 
 async def main():
@@ -13,7 +13,7 @@ async def main():
         sys.exit(1)
 
     fact = sys.argv[1]
-    dataset_name = get_dataset_name(str(Path.cwd()))
+    dataset_name = get_dataset_name(str(get_cwd()))
 
     await ensure_cognee_connection()          # <-- add this line
 

@@ -36,27 +36,10 @@ from typing import Iterable
 import cognee
 from cognee.modules.search.types.SearchType import SearchType
 
-from .filetree import build_file_tree
 from pathlib import Path
-def _extract_text(content) -> str:
-    """
-    Normalize OpenAI-style message content into plain text.
-    Some clients (e.g. OpenCode) send content as a list of parts like
-    [{"type": "text", "text": "..."}] instead of a plain string.
-    """
-    if isinstance(content, str):
-        return content
 
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-        return "\n".join(parts)
-
-    return ""
+from .filetree import build_file_tree
+from .utils import extract_text
 # ---------------------------------------------------------------------------
 # 0. Cloud connection (optional)
 #    Called once at startup. If COGNEE_MODE=cloud, routes all subsequent
@@ -325,7 +308,7 @@ async def inject_memory(body: dict, working_directory: str) -> dict:
 
     for message in reversed(messages):
         if message.get("role") == "user":
-            query = _extract_text(message.get("content", "")).strip()
+            query = extract_text(message.get("content", "")).strip()
             break
     print(f"[VERIFY] Recall query: {query}")
 
@@ -346,7 +329,7 @@ async def inject_memory(body: dict, working_directory: str) -> dict:
 
     if messages and messages[0].get("role") == "system":
         # Merge into the existing system message — don't clobber it.
-        existing_content = _extract_text(messages[0].get("content", ""))
+        existing_content = extract_text(messages[0].get("content", ""))
         messages[0] = {
             "role": "system",
             "content": existing_content + "\n\n" + memory_message["content"],

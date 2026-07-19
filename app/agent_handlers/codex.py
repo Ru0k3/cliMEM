@@ -1,24 +1,19 @@
-import shutil
 from pathlib import Path
 
+from ._utils import backup_config, restore_config
 
-def configure(config_path: Path, base_url: str):
+
+def configure(config_path: Path, base_url: str) -> None:
     """Configure Codex CLI to use CliMEM."""
+    backup_config(config_path)
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if config_path.exists():
-        backup_path = config_path.with_suffix(".toml.bak")
-
-        if not backup_path.exists():
-            shutil.copy2(config_path, backup_path)
-
-        lines = config_path.read_text(encoding="utf-8").splitlines()
-    else:
-        lines = []
+    lines = (
+        config_path.read_text(encoding="utf-8").splitlines()
+        if config_path.exists()
+        else []
+    )
 
     found = False
-
     for i, line in enumerate(lines):
         if line.strip().startswith("openai_base_url"):
             lines[i] = f'openai_base_url = "{base_url}"'
@@ -31,12 +26,6 @@ def configure(config_path: Path, base_url: str):
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def restore(config_path: Path):
+def restore(config_path: Path) -> None:
     """Restore the original Codex CLI configuration."""
-
-    backup_path = config_path.with_suffix(".toml.bak")
-
-    if not backup_path.exists():
-        raise FileNotFoundError("Backup configuration not found.")
-
-    shutil.copy2(backup_path, config_path)
+    restore_config(config_path)
