@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -9,6 +10,7 @@ from fastapi.responses import Response, StreamingResponse
 from .config import (
     API_KEY_FINGERPRINT,
     CLI_TOOL,
+    MODEL_FALLBACK,
     MODEL_MAP,
     PROVIDER_API_KEY,
     PROVIDER_BASE_URL,
@@ -98,14 +100,63 @@ async def chat(request: Request):
 
     client = httpx.AsyncClient(timeout=None)
 
-    provider_request = client.build_request(
-        "POST",
-        f"{PROVIDER_BASE_URL}/chat/completions",
-        headers=headers,
-        json=body,
-    )
+    # Providers like NVIDIA NIM intermittently answer with transient
+    # 404/429/5xx even for valid requests. Retry those once transparently,
+    # then walk MODEL_FALLBACK (a chain of backup models) in order before
+    # giving up. Safe: nothing has been streamed to the client yet.
+    transient = {402, 404, 408, 425, 429, 500, 502, 503, 504}
+    response = None
 
-    response = await client.send(provider_request, stream=True)
+    def _log_fallback(prev_model: str | None, next_model: str | None) -> None:
+        logger.warning(
+            "model %s unavailable — falling back to %s",
+            prev_model, next_model or "no further fallbacks",
+        )
+
+    chain = [resolved_model] + [m for m in MODEL_FALLBACK if m != resolved_model]
+
+    for attempt, model in enumerate(chain):
+        body["model"] = model
+
+        provider_request = client.build_request(
+            "POST",
+            f"{PROVIDER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=body,
+        )
+        response = await client.send(provider_request, stream=True)
+
+        if response.status_code == 200:
+            break
+
+        if response.status_code not in transient:
+            # Permanent error (400/401/403...): another attempt of the SAME
+            # model cannot help; a different fallback model might.
+            await response.aclose()
+            if attempt < len(chain) - 1:
+                _log_fallback(model, chain[attempt + 1])
+                continue
+            break
+
+        # Transient provider error.
+        if attempt < len(chain) - 1:
+            # More models left in the chain: quick backoff, then move on.
+            await response.aclose()
+            _log_fallback(model, chain[attempt + 1])
+            await asyncio.sleep(1.5)
+            continue
+
+        # Last entry in the chain: one extra same-model retry for transient
+        # errors (the original single-model behavior), then surface it.
+        await asyncio.sleep(1.5)
+        provider_request = client.build_request(
+            "POST",
+            f"{PROVIDER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=body,
+        )
+        response = await client.send(provider_request, stream=True)
+        break
 
     elapsed = (time.perf_counter() - start_time) * 1000
     logger.info("← %d (%.0f ms)", response.status_code, elapsed)

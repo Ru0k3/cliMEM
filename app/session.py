@@ -184,10 +184,28 @@ async def save_current_session(reason: str) -> None:
 
     print(f"[DEBUG] save_current_session called, reason={reason}, facts extracted={facts}")
 
-    try:
-        await store_memory(facts, dataset_name)
-        await improve_memory(dataset_name)
-        print("✓ Session memory saved")
-    finally:
+    # Providers (e.g. NVIDIA NIM) intermittently reject requests with
+    # transient 404/5xx. A failed save used to silently destroy the chat
+    # log, losing the session's facts forever — so retry, and on final
+    # failure KEEP the log around for the next save cycle instead.
+    max_attempts = 3
+    saved = False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await store_memory(facts, dataset_name)
+            await improve_memory(dataset_name)
+            saved = True
+            break
+        except Exception as exc:
+            print(f"[WARN] memory save attempt {attempt}/{max_attempts} "
+                  f"failed: {exc!r}")
+            if attempt < max_attempts:
+                await asyncio.sleep(2 * attempt)
+
+    if saved:
         clear_chat_log()
-        end_session(reason)
+        print("✓ Session memory saved")
+    else:
+        print(f"[ERROR] Session memory NOT saved after {max_attempts} attempts "
+              f"— keeping chat log; it will be retried on the next save.")
+    end_session(reason)

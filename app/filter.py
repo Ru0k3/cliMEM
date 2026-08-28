@@ -393,7 +393,7 @@ CUE_PATTERNS = {
         r"I plan to|"
         r"trying to|"
         r"learning|"
-        r"studying|"
+        r"studying|studied|studies|study|"
         r"goal is|"
         r"objective is"
         r")\b",
@@ -605,6 +605,25 @@ def _categorize_sentence(sentence: str) -> str | None:
 
     return None
 
+
+def _semantic_category(sentence: str) -> str | None:
+    """Embedding-backed fallback for sentences the regex cues missed.
+
+    Imported lazily so `import app.filter` stays instant and the embedding
+    model only loads when the semantic tier is actually needed. Disabled via
+    CLIMEM_SEMANTIC=0.
+    """
+    try:
+        from . import semantic
+    except Exception:
+        return None
+    hit = semantic.classify(sentence)
+    if hit is None:
+        return None
+    category, score = hit
+    print(f"[semantic] '{sentence[:60]}...' -> {category} ({score:.2f})")
+    return category
+
 # ─── Self-containment repair ───────────────────────────────────────────────────
 
 def _make_self_contained(sentence: str, topic_subject: str) -> str | None:
@@ -753,7 +772,13 @@ def process_session(chat_log: str, working_directory: str, session_name: str) ->
 
             category = _categorize_sentence(sentence)
             if category is None:
-                continue  # no cue phrase, not confidently categorizable
+                # Regex tier had no cue — fall back to local embedding
+                # scoring so non-dev domains (research, casual chat, ...)
+                # still produce facts. See app/semantic.py.
+                semantic_hit = _semantic_category(sentence)
+                if semantic_hit is None:
+                    continue  # neither tier could categorize confidently
+                category = semantic_hit
 
             repaired = _make_self_contained(sentence, topic_subject)
             if repaired is None:
@@ -803,4 +828,3 @@ if __name__ == "__main__":
     print(f"\nTotal facts: {len(facts)}")
     print("\nRaw JSON:")
     print(json.dumps(facts, indent=2))
-1

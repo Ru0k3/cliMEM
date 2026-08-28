@@ -1,0 +1,278 @@
+"""e2e.py — End-to-end test for cliMEM on cognee 1.5.3.
+
+Orchestrates the full pipeline against a local mock OpenAI-compatible
+provider (test/mock_provider.py) so no real LLM-provider credits are
+spent on the proxy hop. Cognee itself runs in real local mode
+(kuzu + lancedb + fastembed + the configured NIM LLM for cognify).
+
+Phases
+------
+A. REMEMBER
+   1. Start mock provider (port 9919) + climem server (port 8000),
+      with PROVIDER_BASE_URL pointed at the mock.
+   2. Send a chat whose text contains extractable facts.
+   3. SIGINT the server -> graceful shutdown -> session save
+      (filter -> cognee.add -> cognify -> improve).
+B. RECALL
+   4. Restart the server (same cwd => same dataset).
+   5. Send a query chat about the same topic.
+   6. Assert the forwarded request's system message contains the
+      remembered context.
+
+Run:  .venv/bin/python test/e2e.py
+"""
+
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+ROOT = Path(__file__).resolve().parent.parent
+PROVIDER_PORT = 9919
+# Dedicated port so the test NEVER collides with a user-run climem on 8000.
+CLIMEM_PORT = int(os.getenv("CLIMEM_TEST_PORT", "8123"))
+MOCK_URL = f"http://127.0.0.1:{PROVIDER_PORT}"
+CLIMEM_URL = f"http://127.0.0.1:{CLIMEM_PORT}"
+
+PASS: list[str] = []
+FAIL: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    mark = "PASS" if ok else "FAIL"
+    line = f"[{mark}] {name}" + (f" — {detail}" if detail else "")
+    print(line, flush=True)
+    (PASS if ok else FAIL).append(name)
+
+
+def wait_ready(url: str, timeout: float = 60.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = httpx.get(url, timeout=2.0)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def start_mock() -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "test.mock_provider:app",
+         "--port", str(PROVIDER_PORT), "--log-level", "warning"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Popen:
+    # Route the proxy at the mock provider via CLIMEM_ENV_FILE (applied after
+    # cognee's import-time dotenv override — see app/config.py).
+    overlay = ROOT / "test" / "_overlay.env"
+    overlay.write_text(
+        "PROVIDER_NAME=MockProvider\n"
+        "PROVIDER_API_KEY=test-key-not-real\n"
+        f"PROVIDER_BASE_URL={MOCK_URL}/v1\n"
+        "CLI_TOOL=opencode\n"
+    )
+    env = os.environ.copy()
+    env["CLIMEM_ENV_FILE"] = str(overlay)
+    log = open(log_path, "ab")
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(CLIMEM_PORT), "--log-level", "info"],
+        cwd=str(workdir or ROOT),
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = 240.0):
+    """SIGINT and wait for the graceful-shutdown session save to finish."""
+    proc.send_signal(signal.SIGINT)
+    deadline = time.time() + save_timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        text = log_path.read_text(errors="replace")
+        if "Session memory saved" in text or "No sessions recorded" in text:
+            # Give the process a moment to exit after saving.
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+            break
+        time.sleep(1)
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return log_path.read_text(errors="replace")
+
+
+def chat(user_text: str, model: str = "proxy") -> dict:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": user_text},
+        ],
+        "stream": True,
+    }
+    with httpx.Client(timeout=120.0) as client:
+        r = client.post(f"{CLIMEM_URL}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        body = r.text
+    return {"status": r.status_code, "sse": body}
+
+
+FACT_USER = (
+    "For the record: we decided to use PostgreSQL instead of SQLite "
+    "for the climem session storage. The migration must always preserve "
+    "the sessions table schema."
+)
+FACT_ASSISTANT_HINT = (
+    "Understood. The decision was to adopt PostgreSQL for session storage. "
+    "We will migrate the sessions table next sprint."
+)
+QUERY_USER = (
+    "What database engine did we choose for the climem session storage?"
+)
+
+
+def main() -> int:
+    print("=" * 70)
+    print("cliMEM end-to-end test (cognee 1.5.3)")
+    print("=" * 70)
+
+    # Unique throwaway "project" per run. cliMEM scopes memory by working
+    # directory, so a unique directory guarantees a virgin cognee dataset —
+    # wiping the folder alone would NOT reset memory (the dataset lives in
+    # ~/.cognee, keyed by the original path hash).
+    for old in ROOT.glob("test/_sandbox_*"):
+        shutil.rmtree(old, ignore_errors=True)
+    sandbox = ROOT / "test" / f"_sandbox_{int(time.time())}"
+    (sandbox / "src").mkdir(parents=True, exist_ok=True)
+    (sandbox / "src" / "main.py").write_text("print('sandbox')\n")
+
+    mock = start_mock()
+    try:
+        check("mock provider ready", wait_ready(f"{MOCK_URL}/docs"))
+
+        # ---------------- Phase A: remember ----------------
+        log_a = ROOT / "test" / "_server_a.log"
+        log_a.write_bytes(b"")
+        srv_a = start_climem(log_a, workdir=sandbox)
+        ready_a = wait_ready(f"{CLIMEM_URL}/", timeout=240)
+        check("climem server A ready", ready_a)
+        if not ready_a:
+            print("server A log tail:\n" + log_a.read_text(errors="replace")[-1500:])
+            return 1
+
+        resp = chat(FACT_USER)
+        check("proxy forwarded streamed reply", resp["status"] == 200
+              and "Acknowledged" in resp["sse"], f"status={resp['status']}")
+
+        r = httpx.get(f"{MOCK_URL}/last-request", timeout=10)
+        fwd = r.json()
+        sys_content = "".join(
+            m.get("content", "") for m in fwd.get("messages", [])
+            if m.get("role") == "system"
+        )
+        check("first turn has no stale memory injection",
+              "prior context remembered" not in sys_content)
+
+        r = httpx.get(f"{CLIMEM_URL}/chat-log", timeout=10)
+        chat_log = r.json()
+        check("chat log captured turns", isinstance(chat_log, list)
+              and len(chat_log) >= 2, f"entries={len(chat_log)}")
+
+        print("-- shutting down server A (graceful session save) --", flush=True)
+        text_a = stop_climem(srv_a, log_a)
+
+        check("session started marker", "Session started" in text_a)
+        check("shutdown save ran", "Saving session..." in text_a)
+        check("memory stored via cognee", "Session memory saved" in text_a,
+              "(requires facts extracted + add/cognify/improve success)")
+        if "Traceback" in text_a:
+            tail = text_a[text_a.rfind("Traceback"):][:1500]
+            print(tail)
+
+        # ---------------- Phase B: recall ----------------
+        httpx.delete(f"{MOCK_URL}/reset", timeout=10)
+
+        log_b = ROOT / "test" / "_server_b.log"
+        log_b.write_bytes(b"")
+        srv_b = start_climem(log_b, workdir=sandbox)
+        check("climem server B ready", wait_ready(f"{CLIMEM_URL}/", timeout=240))
+
+        resp = chat(QUERY_USER)
+        check("query turn proxied", resp["status"] == 200)
+
+        r = httpx.get(f"{MOCK_URL}/last-request", timeout=10)
+        fwd = r.json()
+        sys_content = "\n".join(
+            m.get("content", "") for m in fwd.get("messages", [])
+            if m.get("role") == "system"
+        )
+        injected = "prior context remembered" in sys_content
+        recalled_pg = "postgres" in sys_content.lower()
+        check("memory injected into system message", injected)
+        check("recalled fact mentions PostgreSQL", recalled_pg)
+        check("project file tree injected",
+              "main.py" in sys_content and "src" in sys_content)
+
+        # Title-generation requests must bypass memory injection.
+        httpx.delete(f"{MOCK_URL}/reset", timeout=10)
+        payload = {
+            "model": "proxy",
+            "messages": [
+                {"role": "system",
+                 "content": "You are a title generator. Summarize in 5 words."},
+                {"role": "user", "content": QUERY_USER},
+            ],
+        }
+        with httpx.Client(timeout=30.0) as client:
+            client.post(f"{CLIMEM_URL}/v1/chat/completions", json=payload)
+        r = httpx.get(f"{MOCK_URL}/last-request", timeout=10)
+        fwd = r.json()
+        title_sys = "\n".join(
+            m.get("content", "") for m in fwd.get("messages", [])
+            if m.get("role") == "system"
+        )
+        check("title-generator requests skip memory injection",
+              "prior context remembered" not in title_sys)
+
+        print("-- shutting down server B --", flush=True)
+        stop_climem(srv_b, log_b)
+
+    finally:
+        mock.terminate()
+        try:
+            mock.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            mock.kill()
+
+    print("=" * 70)
+    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
+    if FAIL:
+        print("Failed checks:")
+        for name in FAIL:
+            print(f"  - {name}")
+    print("=" * 70)
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

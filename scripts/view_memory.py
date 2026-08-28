@@ -1,6 +1,8 @@
 import asyncio
-from cognee.api.v1.visualize.visualize import visualize_graph
-from app.memory import get_dataset_name
+
+import cognee
+
+from app.memory import ensure_cognee_connection, get_dataset_name
 from app.utils import get_cwd
 
 async def main():
@@ -9,7 +11,8 @@ async def main():
     print(f"Visualizing dataset: {dataset_name}")
 
     output_path = str(get_cwd() / "graph_after_recall.html")
-    await visualize_graph(output_path, dataset=dataset_name)
+    await ensure_cognee_connection()
+    await cognee.visualize_graph(output_path, dataset=dataset_name)
     print(f"Graph written to {output_path} — open it in a browser")
 
 if __name__ == "__main__":

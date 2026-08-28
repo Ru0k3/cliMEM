@@ -1,0 +1,22 @@
+--- /home/aizen/Projects/cognee-153/cognee/infrastructure/llm/structured_output_framework/litellm_native/native_adapter.py	2026-08-24 07:10:45.634713509 +0530
++++ .venv/lib/python3.14/site-packages/cognee/infrastructure/llm/structured_output_framework/litellm_native/native_adapter.py	2026-08-24 14:30:58.518826199 +0530
+@@ -368,7 +368,18 @@
+                     # required to be supplied and to be false". Non-strict mode
+                     # accepts those schemas as guidance, so demote and retry
+                     # once before giving up on the native path entirely.
+-                    if "schema" not in str(error).lower():
++                    #
++                    # cliMEM local patch: some OpenRouter upstreams wrap the
++                    # real message ("Invalid schema for response_format ...
++                    # Missing 'description'") inside body.metadata.raw and
++                    # surface only "Provider returned error" in str(error).
++                    # Inspect the parsed body too before deciding this 400 is
++                    # not schema-related.
++                    _err_text = str(error)
++                    _body = getattr(error, "body", None)
++                    if isinstance(_body, dict):
++                        _err_text += " " + str(_body.get("metadata", {}).get("raw", ""))
++                    if "schema" not in _err_text.lower():
+                         raise
+                     if strict:
+                         _NONSTRICT_DEMOTIONS.add(demotion_key)

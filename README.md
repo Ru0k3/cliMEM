@@ -71,44 +71,59 @@ CLI Agent  →  cliMEM proxy (localhost:8000)  →  AI Provider
 
 ## 🚀 Getting started
 
-**Requirements:** Python 3.10+
+**Requirements:** Python 3.10+, an API key from any OpenAI-compatible provider.
+
+### 1. Install (one command)
 
 ```bash
 git clone https://github.com/Ru0k3/cliMEM.git
 cd cliMEM
-pip install -r requirements.txt
-pip install -e .
+./install.sh
 ```
 
-Create a `.env` in the project root:
+The installer creates an isolated virtualenv, installs everything, links the
+`climem` command into `~/.local/bin` (available in every terminal and shell,
+no venv activation needed), and bootstraps your `.env`.
 
-```env
-PROVIDER_NAME=YourProvider
-PROVIDER_API_KEY=sk-...
-PROVIDER_BASE_URL=https://api.yourprovider.com/v1
-CLI_TOOL=opencode
+> Prefer manual setup? Create a venv, then:
+> `pip install -r requirements.txt && pip install -e . && ln -s "$(pwd)/.venv/bin/climem" ~/.local/bin/climem`
 
-# Model aliases (map to real model IDs on your provider)
-MODEL_PROXY=your-default-model
-MODEL_CLAUDE=...
-MODEL_KIMI=...
-
-# Cognee: "local" (default) or hosted
-COGNEE_MODE=local
-# COGNEE_SERVICE_URL=...
-# COGNEE_API_KEY=...
-```
-
-Then:
+### 2. Configure your provider
 
 ```bash
-# 1. Start the memory proxy
+cp .env.example .env   # the installer already did this if .env didn't exist
+```
+
+Edit `.env` and set at minimum:
+
+```env
+PROVIDER_API_KEY=your-key-here
+MODEL_PROXY=a-model-id-your-provider-supports
+# Optional: backup models tried in order when the primary keeps failing
+MODEL_FALLBACK=another-model-id,yet-another-model-id
+```
+
+Everything else (provider endpoints, cognee local-mode settings) has working
+defaults. If you change `PROVIDER_API_KEY`, set `LLM_API_KEY` to the same key.
+
+**Provider flakiness:** the proxy transparently retries transient provider
+errors (429/5xx/404) once on the same model, then automatically walks down
+`MODEL_FALLBACK` (comma-separated, in order) before surfacing an error to your
+CLI. With a fallback configured, a rate-limited or cold-starting primary model
+no longer breaks your chat — the next backup answers instead, and cliMEM logs
+each hop (`model X unavailable — falling back to Y`).
+
+### 3. Run
+
+```bash
+# Terminal 1 — start the memory proxy
 climem start
 
-# 2. Point your agent at it (in another terminal)
+# Terminal 2 — route your agent through it (backs up its config)
 climem configure opencode      # or: claude / codex
 
-# 3. Use your agent exactly as before — memory just works.
+# Use your agent exactly as before — memory just works.
+cd ~/Projects/my-app && opencode
 ```
 
 ## ⌨️ Commands
@@ -119,8 +134,13 @@ climem configure <agent>   # route an agent through cliMEM (backs up config)
 climem restore <agent>     # restore the agent's original config
 climem history [--limit N] # show recent sessions across projects
 climem forget [--yes]      # delete all memory for the current project
+climem graph [--open]      # render this project's knowledge graph to HTML
 climem --version
 ```
+
+The only graphical surface is the knowledge-graph view: `climem graph`
+writes a self-contained HTML file you can open in any browser. Everything
+else lives in the terminal.
 
 ## 📁 Project structure
 
@@ -134,8 +154,27 @@ app/
 ├── session.py        # idle watcher + end-of-session persistence
 ├── storage.py        # SQLite session records
 ├── filetree.py       # live project file-tree snapshot
+├── display.py        # terminal UI (banner, history table)
+├── semantic.py       # embedding fallback for fact extraction (local, offline)
 └── agent_handlers/   # per-agent config writers (claude, opencode, codex)
+patches/              # local cognee fixes; run apply-cognee-patches.sh after reinstall
+test/
+├── e2e.py            # end-to-end test (mock provider → proxy → cognee recall)
+└── mock_provider.py  # OpenAI-compatible stub so tests spend no provider credits
 ```
+
+## 🧪 End-to-end test
+
+```bash
+python test/e2e.py
+```
+
+Boots a mock OpenAI-compatible provider plus the real cliMEM server against
+a throwaway project directory, pushes a conversation through the proxy,
+shuts the server down (triggering the real cognee add/cognify/improve
+pipeline), restarts, and asserts the remembered facts are re-injected on
+the next request. Requires the cognee LLM credentials in `.env` (cognify
+calls your configured LLM); the proxied chat hops themselves are free.
 
 ## 👥 Team
 

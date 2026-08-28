@@ -20,6 +20,7 @@ env/
 
 .env
 .env.*
+!.env.example
 
 # ==========================
 # SQLite
@@ -106,3 +107,9 @@ openspec/config.yaml
 
 # OpenCode local commands
 .opencode/
+
+# E2E test artifacts
+test/_sandbox_*/
+test/_overlay.env
+test/_server_*.log
+graph_after_recall.html

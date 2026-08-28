@@ -10,6 +10,24 @@ from app.utils import get_cwd
 
 
 def cmd_start():
+    from app.config import (
+        CLI_TOOL,
+        MODEL_MAP,
+        PROVIDER_BASE_URL,
+        PROVIDER_NAME,
+    )
+    from app.display import render_banner
+
+    print(render_banner(
+        version="0.1.0",
+        provider_name=PROVIDER_NAME,
+        provider_base_url=PROVIDER_BASE_URL,
+        model_proxy=MODEL_MAP.get("proxy", ""),
+        host="127.0.0.1",
+        port=8000,
+        cli_tool=CLI_TOOL,
+    ))
+
     uvicorn.run(
         "app.main:app",
         host="127.0.0.1",
@@ -61,31 +79,42 @@ def cmd_forget(yes: bool):
     asyncio.run(_forget_task(dataset_name))
     print(f"✓ Memory forgotten for {working_directory}")
 
+
 def cmd_history(limit: int):
+    from app.display import render_history_table
+
     init_database()
     try:
         rows = get_recent_sessions(limit=limit)
     finally:
         close_database()
 
-    if not rows:
-        print("No sessions recorded yet.")
-        return
+    print(render_history_table(rows))
 
-    for (
-        session_name,
-        working_directory,
-        cli_tool,
-        provider_name,
-        model,
-        started_at,
-        ended_at,
-        ended_reason,
-    ) in rows:
-        status = ended_reason or "active"
-        timing = f"{started_at} → {ended_at or '...'}"
-        print(f"{session_name}  {cli_tool}/{provider_name}/{model}  "
-              f"{working_directory}  [{status}]  {timing}")
+
+def cmd_graph(dataset: str | None, output: str | None, open_browser: bool):
+    """Generate the knowledge-graph HTML view for this project's memory."""
+    import webbrowser
+    from pathlib import Path
+
+    from app.memory import ensure_cognee_connection, get_dataset_name
+    from app.utils import get_cwd
+
+    working_directory = str(get_cwd())
+    dataset_name = dataset or get_dataset_name(working_directory)
+    out_path = Path(output) if output else Path.cwd() / "graph_after_recall.html"
+
+    async def run():
+        await ensure_cognee_connection()
+        from cognee.api.v1.visualize.visualize import visualize_graph
+        await visualize_graph(str(out_path), dataset=dataset_name)
+
+    asyncio.run(run())
+
+    print(f"✓ Graph written to {out_path}")
+    if open_browser:
+        webbrowser.open(out_path.as_uri())
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -101,48 +130,68 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # start
-    subparsers.add_parser("start")
+    start = subparsers.add_parser("start", help="Run the memory proxy server")
+    start.add_argument("--banner-only", action="store_true",
+                       help="Print the startup panel and exit (debug)")
 
-    # configure
-    configure = subparsers.add_parser("configure")
-    configure.add_argument(
-        "agent",
-        choices=AGENTS.keys(),
+    configure = subparsers.add_parser(
+        "configure",
+        help="Route an agent through cliMEM (backs up config)",
     )
+    configure.add_argument("agent", choices=AGENTS.keys())
 
-    # restore
-    restore = subparsers.add_parser("restore")
-    restore.add_argument(
-        "agent",
-        choices=AGENTS.keys(),
+    restore = subparsers.add_parser(
+        "restore",
+        help="Restore an agent's original config",
     )
+    restore.add_argument("agent", choices=AGENTS.keys())
 
-    # forget
     forget = subparsers.add_parser(
         "forget",
         help="Delete all remembered context for the current project directory.",
     )
-    forget.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the confirmation prompt.",
-    )
+    forget.add_argument("--yes", action="store_true",
+                        help="Skip the confirmation prompt.")
 
-    # history
     history = subparsers.add_parser(
         "history",
         help="Show recent sessions across all projects.",
     )
-    history.add_argument(
-        "--limit",
-        type=int,
-        default=5,
+    history.add_argument("--limit", type=int, default=5)
+
+    graph = subparsers.add_parser(
+        "graph",
+        help="Render the project knowledge graph to HTML.",
     )
+    graph.add_argument("--dataset", default=None,
+                       help="Dataset name (default: current project).")
+    graph.add_argument("--output", "-o", default=None,
+                       help="Output HTML path "
+                            "(default: ./graph_after_recall.html).")
+    graph.add_argument("--open", action="store_true", dest="open_browser",
+                       help="Open the generated file in a browser.")
 
     args = parser.parse_args()
 
     if args.command == "start":
+        if getattr(args, "banner_only", False):
+            from app.config import (
+                CLI_TOOL,
+                MODEL_MAP,
+                PROVIDER_BASE_URL,
+                PROVIDER_NAME,
+            )
+            from app.display import render_banner
+            print(render_banner(
+                version="0.1.0",
+                provider_name=PROVIDER_NAME,
+                provider_base_url=PROVIDER_BASE_URL,
+                model_proxy=MODEL_MAP.get("proxy", ""),
+                host="127.0.0.1",
+                port=8000,
+                cli_tool=CLI_TOOL,
+            ))
+            return
         cmd_start()
         return
 
@@ -160,6 +209,10 @@ def main():
 
     if args.command == "history":
         cmd_history(args.limit)
+        return
+
+    if args.command == "graph":
+        cmd_graph(args.dataset, args.output, args.open_browser)
         return
 
     parser.print_help()
