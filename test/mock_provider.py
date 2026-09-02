@@ -1,24 +1,111 @@
-"""mock_provider.py — Minimal OpenAI-compatible chat completions stub.
-
-Used by the end-to-end test to exercise cliMEM's proxy without calling a
-real LLM provider. Records every forwarded request so tests can assert on
-the system message cliMEM injected.
-
-Run:  .venv/bin/python -m uvicorn test.mock_provider:app --port 9919
-"""
+"""mock_provider.py — Minimal OpenAI-compatible provider for integration tests."""
 
 import json
+import re
+from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
 
 last_request: dict = {}
 request_log: list[dict] = []
-# Failure injection for tests: maps model name -> status code to reject with.
-# Managed at runtime via the /failmode endpoints below; empty = never fail.
 fail_mode: dict[str, int] = {}
+
+
+FACT_TEXT = (
+    "PostgreSQL was chosen instead of SQLite for cliMEM session storage; "
+    "the sessions table schema must be preserved during migration."
+)
+
+
+def _resolve_schema(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the local `$defs` references emitted by Pydantic schemas."""
+    reference = schema.get("$ref")
+    if not reference or not reference.startswith("#/$defs/"):
+        return schema
+    definition = root.get("$defs", {}).get(reference.removeprefix("#/$defs/"), {})
+    return definition if isinstance(definition, dict) else schema
+
+
+def _schema_value(name: str, schema: dict[str, Any], root: dict[str, Any]) -> Any:
+    """Build a small valid value for a JSON-schema property."""
+    schema = _resolve_schema(schema, root)
+    if "anyOf" in schema:
+        non_null = [item for item in schema["anyOf"] if item.get("type") != "null"]
+        if non_null:
+            return _schema_value(name, non_null[0], root)
+        return None
+    schema_type = schema.get("type")
+    if schema_type == "object" or "properties" in schema:
+        return {
+            child_name: _schema_value(child_name, child_schema, root)
+            for child_name, child_schema in schema.get("properties", {}).items()
+        }
+    if schema_type == "array":
+        item_schema = schema.get("items", {})
+        lowered = name.lower()
+        if lowered in {"entities", "nodes", "facts", "memories", "items"}:
+            return [_schema_value(name.rstrip("s"), item_schema, root)]
+        return []
+    if schema_type == "boolean":
+        return False
+    if schema_type in {"integer", "number"}:
+        return 0
+    if schema_type == "null":
+        return None
+
+    lowered = name.lower()
+    if any(word in lowered for word in
+           ("text", "content", "description", "summary", "answer", "response")):
+        return FACT_TEXT
+    if any(word in lowered for word in ("name", "label", "title", "entity")):
+        return "PostgreSQL"
+    if any(word in lowered for word in ("relation", "type", "category")):
+        return "decision"
+    return "mock"
+
+
+def _structured_payload(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a deterministic payload for JSON-schema or prompted JSON calls."""
+    response_format = body.get("response_format") or {}
+    schema_wrapper = response_format.get("json_schema") or {}
+    schema = schema_wrapper.get("schema") or {}
+
+    # Cognee's native adapter uses response_format=json_object and puts the
+    # actual Pydantic schema in a fenced JSON block in the system prompt.
+    if not schema and response_format.get("type") == "json_object":
+        messages_text = "\n".join(
+            str(message.get("content", ""))
+            for message in body.get("messages", [])
+            if isinstance(message, dict)
+        )
+        matches = re.findall(r"```json\s*(\{.*?\})\s*```", messages_text, re.DOTALL)
+        for candidate in reversed(matches):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and ("properties" in parsed or "$defs" in parsed):
+                schema = parsed
+                break
+
+    if not schema:
+        return None
+    if schema.get("type") == "object" or "properties" in schema:
+        return {
+            name: _schema_value(name, property_schema, schema)
+            for name, property_schema in schema.get("properties", {}).items()
+        }
+    return _schema_value("response", schema, schema)
+
+
+def _chat_content(body: dict[str, Any]) -> str:
+    structured = _structured_payload(body)
+    if structured is not None:
+        return json.dumps(structured)
+    return "Acknowledged — continuing the task."
 
 
 @app.post("/v1/embeddings")
@@ -27,7 +114,6 @@ async def embeddings(request: Request):
     body = await request.json()
     raw_input = body.get("input", [])
     inputs = raw_input if isinstance(raw_input, list) else [raw_input]
-
     data = []
     for index, value in enumerate(inputs):
         text = str(value)
@@ -35,21 +121,13 @@ async def embeddings(request: Request):
                    for position, char in enumerate(text))
         vector = [((seed + (index + 1) * (dimension + 1)) % 2000) / 1000 - 1
                   for dimension in range(384)]
-        data.append({
-            "object": "embedding",
-            "embedding": vector,
-            "index": index,
-        })
-
+        data.append({"object": "embedding", "embedding": vector, "index": index})
     token_count = sum(len(str(value).split()) for value in inputs)
     return {
         "object": "list",
         "data": data,
         "model": body.get("model", "mock-embedding"),
-        "usage": {
-            "prompt_tokens": token_count,
-            "total_tokens": token_count,
-        },
+        "usage": {"prompt_tokens": token_count, "total_tokens": token_count},
     }
 
 
@@ -59,19 +137,26 @@ async def chat_completions(request: Request):
     body = await request.json()
     last_request = body
     request_log.append(body)
-
     model = body.get("model", "")
     if model in fail_mode:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=fail_mode[model],
             content={"error": {"message": f"injected failure for {model}",
-                               "type": "test_failure"}},
+                                "type": "test_failure"}},
         )
 
+    content = _chat_content(body)
+    if not body.get("stream", False):
+        return {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
     async def sse_stream():
-        for token in ["Acknowledged", " — ", "continuing", " the", " task."]:
+        for token in [content]:
             chunk = {
                 "id": "chatcmpl-mock",
                 "object": "chat.completion.chunk",
@@ -104,8 +189,6 @@ async def reset():
 
 @app.post("/failmode")
 async def set_fail_mode(request: Request):
-    """Test hook: {"model": "m", "status": 429} to reject a model;
-    {"model": "m"} (no status) clears it."""
     spec = await request.json()
     model, status = spec.get("model", ""), spec.get("status")
     if status is None:

@@ -38,6 +38,7 @@ PROVIDER_PORT = 9919
 CLIMEM_PORT = int(os.getenv("CLIMEM_TEST_PORT", "8123"))
 MOCK_URL = f"http://127.0.0.1:{PROVIDER_PORT}"
 CLIMEM_URL = f"http://127.0.0.1:{CLIMEM_PORT}"
+SAVE_TIMEOUT = float(os.getenv("CLIMEM_E2E_SAVE_TIMEOUT", "90"))
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -131,7 +132,28 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
     )
 
 
-def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = 240.0):
+def print_stage_diagnostics(stage: str, log_path: Path) -> None:
+    """Print bounded diagnostics when a Cognee stage fails or times out."""
+    print(f"--- diagnostics: {stage} ---", flush=True)
+    if log_path.exists():
+        print(f"server log tail ({log_path}):", flush=True)
+        print(log_path.read_text(errors="replace")[-6000:], flush=True)
+    try:
+        response = httpx.get(f"{MOCK_URL}/request-log", timeout=5)
+        requests = response.json().get("requests", [])
+        structured = sum(1 for item in requests if item.get("response_format"))
+        embeddings = sum(1 for item in requests if "input" in item and "model" in item)
+        models = [item.get("model", "?") for item in requests[-10:]]
+        print(
+            f"mock requests: total={len(requests)} structured={structured} "
+            f"embedding-like={embeddings} recent_models={models}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"mock diagnostics unavailable: {exc!r}", flush=True)
+
+
+def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = SAVE_TIMEOUT):
     """SIGINT and wait for the graceful-shutdown session save to finish."""
     proc.send_signal(signal.SIGINT)
     deadline = time.time() + save_timeout
@@ -148,6 +170,7 @@ def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = 24
             break
         time.sleep(1)
     else:
+        print_stage_diagnostics("Cognee save timeout", log_path)
         proc.terminate()
     try:
         proc.wait(timeout=30)
@@ -238,8 +261,11 @@ def main() -> int:
 
         check("session started marker", "Session started" in text_a)
         check("shutdown save ran", "Saving session..." in text_a)
-        check("memory stored via cognee", "Session memory saved" in text_a,
+        memory_saved = "Session memory saved" in text_a
+        check("memory stored via cognee", memory_saved,
               "(requires facts extracted + add/cognify/improve success)")
+        if not memory_saved:
+            print_stage_diagnostics("Cognee persistence", log_a)
         if "Traceback" in text_a:
             tail = text_a[text_a.rfind("Traceback"):][:1500]
             print(tail)
@@ -265,6 +291,8 @@ def main() -> int:
         recalled_pg = "postgres" in sys_content.lower()
         check("memory injected into system message", injected)
         check("recalled fact mentions PostgreSQL", recalled_pg)
+        if not injected or not recalled_pg:
+            print_stage_diagnostics("Cognee recall", log_b)
         check("project file tree injected",
               "main.py" in sys_content and "src" in sys_content)
 
