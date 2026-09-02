@@ -38,7 +38,9 @@ PROVIDER_PORT = 9919
 CLIMEM_PORT = int(os.getenv("CLIMEM_TEST_PORT", "8123"))
 MOCK_URL = f"http://127.0.0.1:{PROVIDER_PORT}"
 CLIMEM_URL = f"http://127.0.0.1:{CLIMEM_PORT}"
-SAVE_TIMEOUT = float(os.getenv("CLIMEM_E2E_SAVE_TIMEOUT", "90"))
+SAVE_TIMEOUT = float(os.getenv("CLIMEM_E2E_SAVE_TIMEOUT", "45"))
+POST_SAVE_TIMEOUT = float(os.getenv("CLIMEM_E2E_POST_SAVE_TIMEOUT", "3"))
+CLEANUP_TIMEOUT = float(os.getenv("CLIMEM_E2E_CLEANUP_TIMEOUT", "5"))
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -153,18 +155,24 @@ def print_stage_diagnostics(stage: str, log_path: Path) -> None:
         print(f"mock diagnostics unavailable: {exc!r}", flush=True)
 
 
-def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = SAVE_TIMEOUT):
-    """SIGINT and wait for the graceful-shutdown session save to finish."""
+def stop_climem(
+    proc: subprocess.Popen,
+    log_path: Path,
+    save_timeout: float = SAVE_TIMEOUT,
+    expect_save: bool = True,
+):
+    """Stop a server with bounded persistence and cleanup waits."""
     proc.send_signal(signal.SIGINT)
-    deadline = time.time() + save_timeout
+    deadline = time.time() + (save_timeout if expect_save else POST_SAVE_TIMEOUT)
     while time.time() < deadline:
         if proc.poll() is not None:
             break
         text = log_path.read_text(errors="replace")
-        if "Session memory saved" in text or "No sessions recorded" in text:
-            # Give the process a moment to exit after saving.
+        if not expect_save or "Session memory saved" in text or "No sessions recorded" in text:
+            # Persistence has completed (or is not under test); do not spend
+            # another 15 seconds waiting for uvicorn cleanup.
             try:
-                proc.wait(timeout=15)
+                proc.wait(timeout=POST_SAVE_TIMEOUT)
             except subprocess.TimeoutExpired:
                 proc.terminate()
             break
@@ -173,7 +181,7 @@ def stop_climem(proc: subprocess.Popen, log_path: Path, save_timeout: float = SA
         print_stage_diagnostics("Cognee save timeout", log_path)
         proc.terminate()
     try:
-        proc.wait(timeout=30)
+        proc.wait(timeout=CLEANUP_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
     return log_path.read_text(errors="replace")
@@ -257,7 +265,9 @@ def main() -> int:
               and len(chat_log) >= 2, f"entries={len(chat_log)}")
 
         print("-- shutting down server A (graceful session save) --", flush=True)
+        save_started = time.perf_counter()
         text_a = stop_climem(srv_a, log_a)
+        print(f"Cognee save/shutdown elapsed: {time.perf_counter() - save_started:.2f}s", flush=True)
 
         check("session started marker", "Session started" in text_a)
         check("shutdown save ran", "Saving session..." in text_a)
@@ -318,7 +328,9 @@ def main() -> int:
               "prior context remembered" not in title_sys)
 
         print("-- shutting down server B --", flush=True)
-        stop_climem(srv_b, log_b)
+        cleanup_started = time.perf_counter()
+        stop_climem(srv_b, log_b, expect_save=False)
+        print(f"server B cleanup elapsed: {time.perf_counter() - cleanup_started:.2f}s", flush=True)
 
     finally:
         mock.terminate()
