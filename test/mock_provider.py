@@ -1,6 +1,7 @@
 """Minimal OpenAI-compatible provider used by cliMEM integration tests."""
 
 import json
+import os
 import re
 from typing import Any
 
@@ -10,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 app = FastAPI()
 last_request: dict = {}
 request_log: list[dict] = []
+MAX_REQUEST_LOG = max(1, int(os.getenv("MOCK_PROVIDER_MAX_REQUEST_LOG", "100")))
 fail_mode: dict[str, int] = {}
 
 FACT_TEXT = (
@@ -34,7 +36,7 @@ def _resolve_schema(schema: dict[str, Any], root: dict[str, Any], seen: set[str]
     seen = set() if seen is None else seen
     if reference in seen:
         raise SchemaResolutionError(f"cyclic schema reference: {reference}")
-    name = reference.removeprefix("#/$defs/")
+    name = reference.removeprefix("#/$defs/").replace("~1", "/").replace("~0", "~")
     definition = root.get("$defs", {}).get(name)
     if not isinstance(definition, dict):
         raise SchemaResolutionError(f"unresolved schema reference: {reference}")
@@ -161,6 +163,13 @@ def _chat_content(body: dict[str, Any]) -> str:
     return json.dumps(structured) if structured is not None else "Acknowledged — continuing the task."
 
 
+def _record_request(body: dict[str, Any]) -> None:
+    """Record only the newest bounded window of provider requests."""
+    request_log.append(body)
+    if len(request_log) > MAX_REQUEST_LOG:
+        del request_log[:-MAX_REQUEST_LOG]
+
+
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     body = await request.json()
@@ -182,11 +191,23 @@ async def chat_completions(request: Request):
     global last_request
     body = await request.json()
     last_request = body
-    request_log.append(body)
+    _record_request(body)
     model = body.get("model", "")
     if model in fail_mode:
         return JSONResponse(status_code=fail_mode[model], content={"error": {"message": f"injected failure for {model}", "type": "test_failure"}})
-    content = _chat_content(body)
+    try:
+        content = _chat_content(body)
+    except SchemaResolutionError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": "invalid_structured_schema",
+                }
+            },
+        )
     if not body.get("stream", False):
         return {"id": "chatcmpl-mock", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],

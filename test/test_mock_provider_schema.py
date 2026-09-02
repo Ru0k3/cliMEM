@@ -1,13 +1,19 @@
 import unittest
 
+import httpx
+
 from test.mock_provider import (
     SchemaResolutionError,
     _schema_value,
     _structured_payload,
+    MAX_REQUEST_LOG,
+    app,
+    request_log,
+    _record_request,
 )
 
 
-class MockProviderSchemaTests(unittest.TestCase):
+class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
     def test_const_wins_over_type(self):
         self.assertEqual(_schema_value("status", {"type": "string", "const": "ready"}, {}), "ready")
 
@@ -44,6 +50,21 @@ class MockProviderSchemaTests(unittest.TestCase):
         root = {"$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"$ref": "#/$defs/C"}, "C": {"const": "ready"}}}
         self.assertEqual(_schema_value("state", {"$ref": "#/$defs/A"}, root), "ready")
 
+    def test_nested_ref_chain_inside_one_of(self):
+        root = {
+            "$defs": {
+                "Ready": {"$ref": "#/$defs/Status"},
+                "Status": {"const": "ready"},
+            }
+        }
+        schema = {"oneOf": [{"$ref": "#/$defs/Missing"}, {"$ref": "#/$defs/Ready"}]}
+        self.assertEqual(_schema_value("state", schema, root), "ready")
+
+    def test_json_pointer_escaping_resolves_definition_name(self):
+        root = {"$defs": {"foo/bar~baz": {"const": "escaped"}}}
+        reference = {"$ref": "#/$defs/foo~1bar~0baz"}
+        self.assertEqual(_schema_value("value", reference, root), "escaped")
+
     def test_all_of_conflicting_const_is_rejected(self):
         schema = {
             "allOf": [
@@ -63,6 +84,27 @@ class MockProviderSchemaTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(SchemaResolutionError, "conflicting allOf constraints"):
             _structured_payload({"response_format": {"json_schema": {"schema": schema}}})
+
+    def test_request_log_keeps_only_bounded_tail(self):
+        request_log.clear()
+        for index in range(MAX_REQUEST_LOG + 3):
+            _record_request({"index": index})
+        self.assertEqual(len(request_log), MAX_REQUEST_LOG)
+        self.assertEqual(request_log[0]["index"], 3)
+        request_log.clear()
+
+    async def test_invalid_structured_schema_returns_http_400(self):
+        payload = {
+            "model": "mock-chat",
+            "stream": False,
+            "response_format": {"json_schema": {"schema": {"$ref": "#/$defs/Missing"}}},
+            "messages": [],
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_structured_schema")
 
     def test_unresolved_reference_is_explicit(self):
         with self.assertRaisesRegex(SchemaResolutionError, "unresolved schema reference"):
