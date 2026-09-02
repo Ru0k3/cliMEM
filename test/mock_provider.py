@@ -43,12 +43,24 @@ def _resolve_schema(schema: dict[str, Any], root: dict[str, Any], seen: set[str]
     return _resolve_schema(definition, root, seen | {reference})
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without requiring them to be hashable."""
+    return left == right
+
+
+def _allowed_values(schema: dict[str, Any]) -> list[Any] | None:
+    if "const" in schema:
+        return [schema["const"]]
+    if "enum" in schema:
+        return list(schema["enum"])
+    return None
+
+
 def _constraints_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """Return whether two property schemas cannot share one generated value."""
-    if "const" in left and "const" in right:
-        return left["const"] != right["const"]
-    if "enum" in left and "enum" in right:
-        return not set(left["enum"]).intersection(right["enum"])
+    left_values, right_values = _allowed_values(left), _allowed_values(right)
+    if left_values is not None and right_values is not None:
+        return not any(_json_equal(a, b) for a in left_values for b in right_values)
     return bool(left.get("type") and right.get("type") and left["type"] != right["type"])
 
 
@@ -62,6 +74,7 @@ def _combine_all_of(parts: list[dict[str, Any]], root: dict[str, Any]) -> dict[s
         if part.get("type") not in (None, "object") and "properties" not in part:
             raise SchemaResolutionError("allOf contains a non-object branch")
         for name, property_schema in part.get("properties", {}).items():
+            property_schema = _resolve_schema(property_schema, root)
             previous = merged["properties"].get(name)
             if previous is not None and _constraints_conflict(previous, property_schema):
                 raise SchemaResolutionError(f"conflicting allOf constraints for {name}")
@@ -172,7 +185,14 @@ def _record_request(body: dict[str, Any]) -> None:
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "request body is not valid JSON", "type": "invalid_request_error", "code": "invalid_json"}},
+        )
+    _record_request(body)
     raw_input = body.get("input", [])
     inputs = raw_input if isinstance(raw_input, list) else [raw_input]
     data = []
@@ -189,7 +209,13 @@ async def embeddings(request: Request):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     global last_request
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "request body is not valid JSON", "type": "invalid_request_error", "code": "invalid_json"}},
+        )
     last_request = body
     _record_request(body)
     model = body.get("model", "")

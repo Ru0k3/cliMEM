@@ -10,6 +10,7 @@ from test.mock_provider import (
     app,
     request_log,
     _record_request,
+    _constraints_conflict,
 )
 
 
@@ -114,6 +115,34 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         root = {"$defs": {"Node": {"$ref": "#/$defs/Node"}}}
         with self.assertRaisesRegex(SchemaResolutionError, "cyclic schema reference"):
             _schema_value("node", {"$ref": "#/$defs/Node"}, root)
+
+    def test_const_and_object_enum_intersection_is_safe(self):
+        self.assertFalse(_constraints_conflict({"const": {"kind": "node"}}, {"enum": [{"kind": "node"}]}))
+        self.assertTrue(_constraints_conflict({"const": {"kind": "node"}}, {"enum": [{"kind": "edge"}]}))
+
+    async def test_streamed_invalid_schema_returns_400_without_sse(self):
+        payload = {
+            "model": "mock-chat",
+            "stream": True,
+            "response_format": {"json_schema": {"schema": {"$ref": "#/$defs/Missing"}}},
+            "messages": [],
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("data:", response.text)
+        self.assertEqual(response.json()["error"]["code"], "invalid_structured_schema")
+
+    async def test_malformed_json_returns_400(self):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            chat_response = await client.post("/v1/chat/completions", content=b"{invalid")
+            embedding_response = await client.post("/v1/embeddings", content=b"{invalid")
+        self.assertEqual(chat_response.status_code, 400)
+        self.assertEqual(embedding_response.status_code, 400)
+        self.assertEqual(chat_response.json()["error"]["code"], "invalid_json")
+        self.assertEqual(embedding_response.json()["error"]["code"], "invalid_json")
 
     def test_empty_enum_is_rejected(self):
         with self.assertRaisesRegex(SchemaResolutionError, "empty enum"):
