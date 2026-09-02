@@ -82,8 +82,43 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
         "PROVIDER_API_KEY=test-key-not-real\n"
         f"PROVIDER_BASE_URL={MOCK_URL}/v1\n"
         "CLI_TOOL=opencode\n"
+        # Keep Cognee fully offline and point both its chat and embedding
+        # clients at the OpenAI-compatible mock provider.
+        "LLM_PROVIDER=openai\n"
+        "LLM_API_KEY=test-key-not-real\n"
+        "OPENAI_API_KEY=test-key-not-real\n"
+        "LLM_MODEL=openai/mock-chat\n"
+        f"LLM_ENDPOINT={MOCK_URL}/v1\n"
+        "EMBEDDING_PROVIDER=openai_compatible\n"
+        "EMBEDDING_MODEL=mock-embedding\n"
+        f"EMBEDDING_ENDPOINT={MOCK_URL}/v1\n"
+        "EMBEDDING_API_KEY=test-key-not-real\n"
+        "EMBEDDING_DIMENSIONS=384\n"
+        "EMBEDDING_MAX_TOKENS=256\n"
+        "VECTOR_DB_PROVIDER=lancedb\n"
+        "GRAPH_DATABASE_PROVIDER=kuzu\n"
+        "COGNEE_MODE=local\n"
     )
     env = os.environ.copy()
+    # Cognee is imported before app.config applies CLIMEM_ENV_FILE, so expose
+    # these values directly in the child environment as well. This prevents
+    # Cognee's import-time settings singleton from caching empty credentials.
+    env.update({
+        "LLM_PROVIDER": "openai",
+        "LLM_API_KEY": "test-key-not-real",
+        "OPENAI_API_KEY": "test-key-not-real",
+        "LLM_MODEL": "openai/mock-chat",
+        "LLM_ENDPOINT": f"{MOCK_URL}/v1",
+        "EMBEDDING_PROVIDER": "openai_compatible",
+        "EMBEDDING_MODEL": "mock-embedding",
+        "EMBEDDING_ENDPOINT": f"{MOCK_URL}/v1",
+        "EMBEDDING_API_KEY": "test-key-not-real",
+        "EMBEDDING_DIMENSIONS": "384",
+        "EMBEDDING_MAX_TOKENS": "256",
+        "VECTOR_DB_PROVIDER": "lancedb",
+        "GRAPH_DATABASE_PROVIDER": "kuzu",
+        "COGNEE_MODE": "local",
+    })
     env["CLIMEM_ENV_FILE"] = str(overlay)
     log = open(log_path, "ab")
     return subprocess.Popen(

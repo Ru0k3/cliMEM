@@ -21,6 +21,38 @@ request_log: list[dict] = []
 fail_mode: dict[str, int] = {}
 
 
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    """Return deterministic 384-dimensional embeddings for Cognee tests."""
+    body = await request.json()
+    raw_input = body.get("input", [])
+    inputs = raw_input if isinstance(raw_input, list) else [raw_input]
+
+    data = []
+    for index, value in enumerate(inputs):
+        text = str(value)
+        seed = sum((position + 1) * ord(char)
+                   for position, char in enumerate(text))
+        vector = [((seed + (index + 1) * (dimension + 1)) % 2000) / 1000 - 1
+                  for dimension in range(384)]
+        data.append({
+            "object": "embedding",
+            "embedding": vector,
+            "index": index,
+        })
+
+    token_count = sum(len(str(value).split()) for value in inputs)
+    return {
+        "object": "list",
+        "data": data,
+        "model": body.get("model", "mock-embedding"),
+        "usage": {
+            "prompt_tokens": token_count,
+            "total_tokens": token_count,
+        },
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     global last_request
