@@ -4,6 +4,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,6 +26,7 @@ def _read_positive_int(name: str, default: int) -> int:
 
 
 MAX_REQUEST_LOG = _read_positive_int("MOCK_PROVIDER_MAX_REQUEST_LOG", 100)
+MAX_SCHEMA_DEPTH = _read_positive_int("MOCK_PROVIDER_MAX_SCHEMA_DEPTH", 32)
 fail_mode: dict[str, int] = {}
 
 FACT_TEXT = (
@@ -38,15 +40,23 @@ class SchemaResolutionError(ValueError):
 
 
 def _decode_pointer_token(token: str) -> str:
-    """Decode an RFC 6901 JSON Pointer token."""
+    """Decode and strictly validate an RFC 6901 JSON Pointer token."""
+    if re.search(r"~(?![01])", token):
+        raise SchemaResolutionError(f"invalid JSON Pointer escape: ~ in {token!r}")
     return token.replace("~1", "/").replace("~0", "~")
 
 
 def _resolve_json_pointer(root: Any, reference: str) -> Any:
     """Resolve a JSON Pointer fragment against an arbitrary JSON document."""
-    if not reference.startswith("#"):
+    if not isinstance(reference, str) or not reference.startswith("#"):
         raise SchemaResolutionError(f"unsupported schema reference: {reference}")
     pointer = reference[1:]
+    if re.search(r"%(?![0-9A-Fa-f]{2})", pointer):
+        raise SchemaResolutionError(f"invalid percent escape in JSON Pointer: {reference}")
+    try:
+        pointer = unquote(pointer, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SchemaResolutionError(f"invalid UTF-8 in JSON Pointer: {reference}") from exc
     if pointer == "":
         return root
     if not pointer.startswith("/"):
@@ -59,7 +69,7 @@ def _resolve_json_pointer(root: Any, reference: str) -> Any:
                 raise SchemaResolutionError(f"unresolved schema reference: {reference}")
             value = value[token]
         elif isinstance(value, list):
-            if token == "-" or not token.isdigit() or int(token) >= len(value):
+            if token == "-" or not token.isdigit() or (len(token) > 1 and token.startswith("0")) or int(token) >= len(value):
                 raise SchemaResolutionError(f"unresolved schema reference: {reference}")
             value = value[int(token)]
         else:
@@ -77,6 +87,8 @@ def _resolve_schema(schema: dict[str, Any], root: dict[str, Any], seen: set[str]
     seen = set() if seen is None else seen
     if reference in seen:
         raise SchemaResolutionError(f"cyclic schema reference: {reference}")
+    if len(seen) >= MAX_SCHEMA_DEPTH:
+        raise SchemaResolutionError(f"maximum schema depth exceeded ({MAX_SCHEMA_DEPTH})")
     definition = _resolve_json_pointer(root, reference)
     if not isinstance(definition, dict):
         raise SchemaResolutionError(f"schema reference does not point to an object: {reference}")
@@ -97,22 +109,37 @@ def _allowed_values(schema: dict[str, Any]) -> list[Any] | None:
 
 
 def _constraints_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    """Return whether two property schemas cannot share one generated value."""
+    """Return whether two schemas cannot describe the same JSON value."""
     left_values, right_values = _allowed_values(left), _allowed_values(right)
     if left_values is not None and right_values is not None:
         return not any(_json_equal(a, b) for a in left_values for b in right_values)
-    return bool(left.get("type") and right.get("type") and left["type"] != right["type"])
+    if left.get("type") and right.get("type") and left["type"] != right["type"]:
+        return True
+    if left.get("additionalProperties") is not None and right.get("additionalProperties") is not None:
+        if left["additionalProperties"] != right["additionalProperties"]:
+            return True
+    if isinstance(left.get("properties"), dict) and isinstance(right.get("properties"), dict):
+        for name in left["properties"].keys() & right["properties"].keys():
+            if _constraints_conflict(left["properties"][name], right["properties"][name]):
+                return True
+    return False
 
 
 def _combine_all_of(parts: list[dict[str, Any]], root: dict[str, Any]) -> dict[str, Any]:
     """Merge object constraints from an allOf schema into one generation view."""
     merged: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+    branch_type: str | None = None
     if "$defs" in root:
         merged["$defs"] = root["$defs"]
     for part in parts:
         part = _resolve_schema(part, root)
-        if part.get("type") not in (None, "object") and "properties" not in part:
+        part_type = part.get("type")
+        if part_type not in (None, "object") and "properties" not in part:
             raise SchemaResolutionError("allOf contains a non-object branch")
+        if part_type is not None:
+            if branch_type is not None and branch_type != part_type:
+                raise SchemaResolutionError("conflicting allOf object types")
+            branch_type = part_type
         for name, property_schema in part.get("properties", {}).items():
             property_schema = _resolve_schema(property_schema, root)
             previous = merged["properties"].get(name)
@@ -120,15 +147,24 @@ def _combine_all_of(parts: list[dict[str, Any]], root: dict[str, Any]) -> dict[s
                 raise SchemaResolutionError(f"conflicting allOf constraints for {name}")
             merged["properties"][name] = property_schema
         merged["required"].extend(part.get("required", []))
-        for key in ("$defs", "additionalProperties"):
-            if key in part:
-                merged[key] = part[key]
+        if "additionalProperties" in part:
+            previous_additional = merged.get("additionalProperties")
+            if previous_additional is not None and _constraints_conflict(
+                {"additionalProperties": previous_additional},
+                {"additionalProperties": part["additionalProperties"]},
+            ):
+                raise SchemaResolutionError("conflicting allOf additionalProperties constraints")
+            merged["additionalProperties"] = part["additionalProperties"]
+        if "$defs" in part:
+            merged["$defs"] = part["$defs"]
     merged["required"] = list(dict.fromkeys(merged["required"]))
     return merged
 
 
-def _schema_value(name: str, schema: dict[str, Any], root: dict[str, Any]) -> Any:
+def _schema_value(name: str, schema: dict[str, Any], root: dict[str, Any], depth: int = 0) -> Any:
     """Generate a deterministic value satisfying the supported JSON-schema subset."""
+    if depth > MAX_SCHEMA_DEPTH:
+        raise SchemaResolutionError(f"maximum schema depth exceeded ({MAX_SCHEMA_DEPTH})")
     schema = _resolve_schema(schema, root)
 
     if "const" in schema:
@@ -147,7 +183,7 @@ def _schema_value(name: str, schema: dict[str, Any], root: dict[str, Any]) -> An
         errors = []
         for branch in branches:
             try:
-                return _schema_value(name, branch, root)
+                return _schema_value(name, branch, root, depth + 1)
             except SchemaResolutionError as exc:
                 errors.append(str(exc))
         raise SchemaResolutionError(f"no usable branch for {name}: {'; '.join(errors)}")
@@ -156,13 +192,13 @@ def _schema_value(name: str, schema: dict[str, Any], root: dict[str, Any]) -> An
     schema_type = schema.get("type")
     if schema_type == "object" or "properties" in schema:
         return {
-            child_name: _schema_value(child_name, child_schema, root)
+            child_name: _schema_value(child_name, child_schema, root, depth + 1)
             for child_name, child_schema in schema.get("properties", {}).items()
         }
     if schema_type == "array":
         item_schema = schema.get("items", {})
         if name.lower() in {"entities", "nodes", "facts", "memories", "items"}:
-            return [_schema_value(name.rstrip("s"), item_schema, root)]
+            return [_schema_value(name.rstrip("s"), item_schema, root, depth + 1)]
         return []
     if schema_type == "boolean":
         return False
@@ -322,8 +358,8 @@ async def get_request_log():
 
 @app.delete("/reset")
 async def reset():
-    global last_request, request_log
-    last_request, request_log = {}, []
+    last_request.clear()
+    request_log.clear()
     fail_mode.clear()
     return {"ok": True}
 

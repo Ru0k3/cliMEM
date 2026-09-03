@@ -32,10 +32,25 @@ jobs:
         run: python -m compileall -q app test
 
       - name: Run mock-provider schema unit tests
-        run: python -m unittest -v test.test_mock_provider_schema
+        run: coverage run --branch -m unittest -v test.test_mock_provider_schema
 
       - name: Run fallback integration test
         run: python test/fallback_test.py
 
       - name: Run end-to-end integration test
         run: python test/e2e.py
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          coverage report -m | tee coverage-report.txt
+          coverage html
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-report.txt
+            htmlcov/

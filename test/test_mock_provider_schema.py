@@ -9,6 +9,7 @@ from test.mock_provider import (
     _schema_value,
     _structured_payload,
     MAX_REQUEST_LOG,
+    MAX_SCHEMA_DEPTH,
     app,
     request_log,
     _record_request,
@@ -70,6 +71,18 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         root = {"components": {"schemas": {"Widget": {"const": "widget"}}}}
         self.assertEqual(_resolve_json_pointer(root, "#/components/schemas/Widget"), {"const": "widget"})
 
+    def test_percent_decoded_json_pointer_resolves_nested_schema(self):
+        root = {"components": {"schemas": {"My Schema": {"const": "decoded"}}}}
+        self.assertEqual(_resolve_json_pointer(root, "#/components/schemas/My%20Schema"), {"const": "decoded"})
+
+    def test_invalid_pointer_escape_is_rejected(self):
+        with self.assertRaisesRegex(SchemaResolutionError, "invalid JSON Pointer escape"):
+            _resolve_json_pointer({"a~2b": 1}, "#/a~2b")
+
+    def test_noncanonical_array_index_is_rejected(self):
+        with self.assertRaisesRegex(SchemaResolutionError, "unresolved schema reference"):
+            _resolve_json_pointer({"items": ["x"]}, "#/items/01")
+
     def test_json_pointer_escaping_resolves_definition_name(self):
         root = {"$defs": {"foo/bar~baz": {"const": "escaped"}}}
         reference = {"$ref": "#/$defs/foo~1bar~0baz"}
@@ -83,6 +96,16 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         with self.assertRaisesRegex(SchemaResolutionError, "conflicting allOf constraints"):
+            _structured_payload({"response_format": {"json_schema": {"schema": schema}}})
+
+    def test_all_of_additional_properties_conflict_is_rejected(self):
+        schema = {
+            "allOf": [
+                {"type": "object", "additionalProperties": False},
+                {"type": "object", "additionalProperties": True},
+            ]
+        }
+        with self.assertRaisesRegex(SchemaResolutionError, "additionalProperties"):
             _structured_payload({"response_format": {"json_schema": {"schema": schema}}})
 
     def test_all_of_disjoint_enums_are_rejected(self):
@@ -116,6 +139,40 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret prompt", repr(summary))
         self.assertNotIn("messages", summary)
 
+    async def test_embedding_endpoint_returns_openai_compatible_vectors(self):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.delete("/reset")
+            response = await client.post("/v1/embeddings", json={"model": "mock-embedding", "input": ["secret embedding"]})
+            diagnostics = await client.get("/request-log")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "list")
+        self.assertEqual(len(payload["data"]), 1)
+        self.assertEqual(len(payload["data"][0]["embedding"]), 384)
+        self.assertEqual(diagnostics.json()["requests"][-1]["kind"], "embeddings")
+        self.assertNotIn("secret embedding", repr(diagnostics.json()))
+
+    async def test_chat_endpoint_returns_non_streaming_success(self):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.delete("/reset")
+            response = await client.post("/v1/chat/completions", json={"model": "mock-chat", "messages": [{"role": "user", "content": "hello"}]})
+            diagnostics = await client.get("/request-log")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["message"]["role"], "assistant")
+        self.assertIn("Acknowledged", response.json()["choices"][0]["message"]["content"])
+        self.assertEqual(diagnostics.json()["requests"][-1]["kind"], "chat")
+        self.assertNotIn("hello", repr(diagnostics.json()))
+
+    async def test_chat_endpoint_returns_streaming_sse_success(self):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/v1/chat/completions", json={"model": "mock-chat", "stream": True, "messages": []})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data:", response.text)
+        self.assertIn("[DONE]", response.text)
+
     async def test_invalid_structured_schema_returns_http_400(self):
         payload = {
             "model": "mock-chat",
@@ -137,6 +194,11 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         root = {"$defs": {"Node": {"$ref": "#/$defs/Node"}}}
         with self.assertRaisesRegex(SchemaResolutionError, "cyclic schema reference"):
             _schema_value("node", {"$ref": "#/$defs/Node"}, root)
+
+    def test_schema_depth_limit_is_enforced(self):
+        schema = {"type": "object", "properties": {"child": {"type": "object", "properties": {"leaf": {"const": "x"}}}}}
+        with self.assertRaisesRegex(SchemaResolutionError, "maximum schema depth"):
+            _schema_value("root", schema, {}, depth=MAX_SCHEMA_DEPTH)
 
     def test_const_and_object_enum_intersection_is_safe(self):
         self.assertFalse(_constraints_conflict({"const": {"kind": "node"}}, {"enum": [{"kind": "node"}]}))

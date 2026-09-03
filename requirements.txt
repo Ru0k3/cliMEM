@@ -4,3 +4,4 @@ httpx
 python-dotenv
 cognee==1.5.3
 fastembed
+coverage==7.6.1
