@@ -101,6 +101,10 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
         "VECTOR_DB_PROVIDER=lancedb\n"
         "GRAPH_DATABASE_PROVIDER=kuzu\n"
         "COGNEE_MODE=local\n"
+        "CHUNKS_PER_BATCH=2000\n"
+        "TRIPLET_EMBEDDING=false\n"
+        "CONTRADICTION_DETECTION=false\n"
+        "PROVENANCE_TRACKING=false\n"
     )
     env = os.environ.copy()
     # Cognee is imported before app.config applies CLIMEM_ENV_FILE, so expose
@@ -121,6 +125,10 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
         "VECTOR_DB_PROVIDER": "lancedb",
         "GRAPH_DATABASE_PROVIDER": "kuzu",
         "COGNEE_MODE": "local",
+        "CHUNKS_PER_BATCH": "2000",
+        "TRIPLET_EMBEDDING": "false",
+        "CONTRADICTION_DETECTION": "false",
+        "PROVENANCE_TRACKING": "false",
     })
     env["CLIMEM_ENV_FILE"] = str(overlay)
     log = open(log_path, "ab")
@@ -176,7 +184,7 @@ def stop_climem(
             except subprocess.TimeoutExpired:
                 proc.terminate()
             break
-        time.sleep(1)
+        time.sleep(0.2)
     else:
         print_stage_diagnostics("Cognee save timeout", log_path)
         proc.terminate()
