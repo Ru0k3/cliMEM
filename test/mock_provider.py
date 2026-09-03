@@ -11,7 +11,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 app = FastAPI()
 last_request: dict = {}
 request_log: list[dict] = []
-MAX_REQUEST_LOG = max(1, int(os.getenv("MOCK_PROVIDER_MAX_REQUEST_LOG", "100")))
+
+
+def _read_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {value}")
+    return value
+
+
+MAX_REQUEST_LOG = _read_positive_int("MOCK_PROVIDER_MAX_REQUEST_LOG", 100)
 fail_mode: dict[str, int] = {}
 
 FACT_TEXT = (
@@ -24,22 +37,49 @@ class SchemaResolutionError(ValueError):
     """Raised when a structured mock response cannot resolve its schema."""
 
 
+def _decode_pointer_token(token: str) -> str:
+    """Decode an RFC 6901 JSON Pointer token."""
+    return token.replace("~1", "/").replace("~0", "~")
+
+
+def _resolve_json_pointer(root: Any, reference: str) -> Any:
+    """Resolve a JSON Pointer fragment against an arbitrary JSON document."""
+    if not reference.startswith("#"):
+        raise SchemaResolutionError(f"unsupported schema reference: {reference}")
+    pointer = reference[1:]
+    if pointer == "":
+        return root
+    if not pointer.startswith("/"):
+        raise SchemaResolutionError(f"invalid JSON Pointer: {reference}")
+    value = root
+    for raw_token in pointer[1:].split("/"):
+        token = _decode_pointer_token(raw_token)
+        if isinstance(value, dict):
+            if token not in value:
+                raise SchemaResolutionError(f"unresolved schema reference: {reference}")
+            value = value[token]
+        elif isinstance(value, list):
+            if token == "-" or not token.isdigit() or int(token) >= len(value):
+                raise SchemaResolutionError(f"unresolved schema reference: {reference}")
+            value = value[int(token)]
+        else:
+            raise SchemaResolutionError(f"unresolved schema reference: {reference}")
+    return value
+
+
 def _resolve_schema(schema: dict[str, Any], root: dict[str, Any], seen: set[str] | None = None) -> dict[str, Any]:
-    """Resolve local JSON-schema references and fail clearly on bad references."""
+    """Resolve JSON-schema references and fail clearly on bad references."""
     if not isinstance(schema, dict):
         raise SchemaResolutionError(f"schema must be an object, got {type(schema).__name__}")
     reference = schema.get("$ref")
     if not reference:
         return schema
-    if not reference.startswith("#/$defs/"):
-        raise SchemaResolutionError(f"unsupported schema reference: {reference}")
     seen = set() if seen is None else seen
     if reference in seen:
         raise SchemaResolutionError(f"cyclic schema reference: {reference}")
-    name = reference.removeprefix("#/$defs/").replace("~1", "/").replace("~0", "~")
-    definition = root.get("$defs", {}).get(name)
+    definition = _resolve_json_pointer(root, reference)
     if not isinstance(definition, dict):
-        raise SchemaResolutionError(f"unresolved schema reference: {reference}")
+        raise SchemaResolutionError(f"schema reference does not point to an object: {reference}")
     return _resolve_schema(definition, root, seen | {reference})
 
 
@@ -176,9 +216,31 @@ def _chat_content(body: dict[str, Any]) -> str:
     return json.dumps(structured) if structured is not None else "Acknowledged — continuing the task."
 
 
-def _record_request(body: dict[str, Any]) -> None:
-    """Record only the newest bounded window of provider requests."""
-    request_log.append(body)
+def _request_summary(body: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Return redacted metadata suitable for bounded diagnostics."""
+    if kind == "embeddings":
+        raw_input = body.get("input", [])
+        inputs = raw_input if isinstance(raw_input, list) else [raw_input]
+        return {
+            "kind": kind,
+            "model": body.get("model", ""),
+            "input_count": len(inputs),
+            "input_chars": sum(len(str(value)) for value in inputs),
+        }
+    messages = body.get("messages", [])
+    return {
+        "kind": kind,
+        "model": body.get("model", ""),
+        "stream": bool(body.get("stream", False)),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "response_format": (body.get("response_format") or {}).get("type"),
+        "has_json_schema": bool((body.get("response_format") or {}).get("json_schema")),
+    }
+
+
+def _record_request(body: dict[str, Any], kind: str = "chat") -> None:
+    """Record only redacted metadata for the newest bounded request window."""
+    request_log.append(_request_summary(body, kind))
     if len(request_log) > MAX_REQUEST_LOG:
         del request_log[:-MAX_REQUEST_LOG]
 
@@ -192,7 +254,7 @@ async def embeddings(request: Request):
             status_code=400,
             content={"error": {"message": "request body is not valid JSON", "type": "invalid_request_error", "code": "invalid_json"}},
         )
-    _record_request(body)
+    _record_request(body, "embeddings")
     raw_input = body.get("input", [])
     inputs = raw_input if isinstance(raw_input, list) else [raw_input]
     data = []
@@ -268,12 +330,33 @@ async def reset():
 
 @app.post("/failmode")
 async def set_fail_mode(request: Request):
-    spec = await request.json()
-    model, status = spec.get("model", ""), spec.get("status")
+    try:
+        spec = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "request body is not valid JSON", "type": "invalid_request_error", "code": "invalid_json"}},
+        )
+    if not isinstance(spec, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode body must be a JSON object", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
+    model, status = spec.get("model"), spec.get("status")
+    if not isinstance(model, str) or not model.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode.model must be a non-empty string", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
+    if status is not None and (isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode.status must be an integer HTTP status from 100 to 599", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
     if status is None:
         fail_mode.pop(model, None)
     else:
-        fail_mode[model] = int(status)
+        fail_mode[model] = status
     return {"ok": True, "fail_mode": dict(fail_mode)}
 
 

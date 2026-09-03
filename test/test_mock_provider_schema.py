@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -11,6 +13,9 @@ from test.mock_provider import (
     request_log,
     _record_request,
     _constraints_conflict,
+    _read_positive_int,
+    _resolve_json_pointer,
+    _request_summary,
 )
 
 
@@ -61,6 +66,10 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         schema = {"oneOf": [{"$ref": "#/$defs/Missing"}, {"$ref": "#/$defs/Ready"}]}
         self.assertEqual(_schema_value("state", schema, root), "ready")
 
+    def test_general_json_pointer_resolves_nested_schema(self):
+        root = {"components": {"schemas": {"Widget": {"const": "widget"}}}}
+        self.assertEqual(_resolve_json_pointer(root, "#/components/schemas/Widget"), {"const": "widget"})
+
     def test_json_pointer_escaping_resolves_definition_name(self):
         root = {"$defs": {"foo/bar~baz": {"const": "escaped"}}}
         reference = {"$ref": "#/$defs/foo~1bar~0baz"}
@@ -86,13 +95,26 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SchemaResolutionError, "conflicting allOf constraints"):
             _structured_payload({"response_format": {"json_schema": {"schema": schema}}})
 
-    def test_request_log_keeps_only_bounded_tail(self):
+    def test_request_log_keeps_only_bounded_redacted_tail(self):
         request_log.clear()
         for index in range(MAX_REQUEST_LOG + 3):
-            _record_request({"index": index})
+            _record_request({"model": f"model-{index}", "messages": [{"content": "secret"}]})
         self.assertEqual(len(request_log), MAX_REQUEST_LOG)
-        self.assertEqual(request_log[0]["index"], 3)
+        self.assertEqual(request_log[0]["model"], "model-3")
+        self.assertNotIn("secret", repr(request_log))
+        self.assertNotIn("messages", request_log[0])
         request_log.clear()
+
+    def test_invalid_environment_value_is_rejected(self):
+        with patch.dict(os.environ, {"MOCK_PROVIDER_TEST_LIMIT": "not-a-number"}):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                _read_positive_int("MOCK_PROVIDER_TEST_LIMIT", 10)
+
+    def test_request_summary_contains_metadata_only(self):
+        summary = _request_summary({"model": "mock", "messages": [{"role": "user", "content": "secret prompt"}]}, "chat")
+        self.assertEqual(summary["message_count"], 1)
+        self.assertNotIn("secret prompt", repr(summary))
+        self.assertNotIn("messages", summary)
 
     async def test_invalid_structured_schema_returns_http_400(self):
         payload = {
@@ -133,6 +155,19 @@ class MockProviderSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("data:", response.text)
         self.assertEqual(response.json()["error"]["code"], "invalid_structured_schema")
+
+    async def test_malformed_failmode_and_invalid_values_return_400(self):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            malformed = await client.post("/failmode", content=b"{invalid")
+            missing_model = await client.post("/failmode", json={"status": 500})
+            invalid_status = await client.post("/failmode", json={"model": "mock", "status": "500"})
+            out_of_range = await client.post("/failmode", json={"model": "mock", "status": 700})
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(malformed.json()["error"]["code"], "invalid_json")
+        for response in (missing_model, invalid_status, out_of_range):
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["error"]["code"], "invalid_failmode")
 
     async def test_malformed_json_returns_400(self):
         transport = httpx.ASGITransport(app=app)
