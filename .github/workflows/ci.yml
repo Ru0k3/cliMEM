@@ -32,7 +32,7 @@ jobs:
         run: python -m compileall -q app test
 
       - name: Run mock-provider schema unit tests
-        run: coverage run --branch -m unittest -v test.test_mock_provider_schema
+        run: coverage run --branch -m unittest -v test.test_mock_provider_schema test.test_mock_provider_concurrency
 
       - name: Run fallback integration test
         run: python test/fallback_test.py

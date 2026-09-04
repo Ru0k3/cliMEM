@@ -28,6 +28,8 @@ def _read_positive_int(name: str, default: int) -> int:
 MAX_REQUEST_LOG = _read_positive_int("MOCK_PROVIDER_MAX_REQUEST_LOG", 100)
 MAX_SCHEMA_DEPTH = _read_positive_int("MOCK_PROVIDER_MAX_SCHEMA_DEPTH", 32)
 fail_mode: dict[str, int] = {}
+delay_mode: dict[str, dict[str, int]] = {}
+request_counts: dict[str, int] = {}
 
 FACT_TEXT = (
     "PostgreSQL was chosen instead of SQLite for cliMEM session storage; "
@@ -252,6 +254,18 @@ def _chat_content(body: dict[str, Any]) -> str:
     return json.dumps(structured) if structured is not None else "Acknowledged — continuing the task."
 
 
+async def _maybe_delay(model: str) -> None:
+    """Inject a deterministic intermittent delay for timeout stress tests."""
+    config = delay_mode.get(model)
+    if not config:
+        return
+    request_counts[model] = request_counts.get(model, 0) + 1
+    every = config["timeout_every"]
+    if request_counts[model] % every == 0:
+        import asyncio
+        await asyncio.sleep(config["timeout_ms"] / 1000)
+
+
 def _request_summary(body: dict[str, Any], kind: str) -> dict[str, Any]:
     """Return redacted metadata suitable for bounded diagnostics."""
     if kind == "embeddings":
@@ -291,6 +305,7 @@ async def embeddings(request: Request):
             content={"error": {"message": "request body is not valid JSON", "type": "invalid_request_error", "code": "invalid_json"}},
         )
     _record_request(body, "embeddings")
+    await _maybe_delay(body.get("model", ""))
     raw_input = body.get("input", [])
     inputs = raw_input if isinstance(raw_input, list) else [raw_input]
     data = []
@@ -319,6 +334,7 @@ async def chat_completions(request: Request):
     model = body.get("model", "")
     if model in fail_mode:
         return JSONResponse(status_code=fail_mode[model], content={"error": {"message": f"injected failure for {model}", "type": "test_failure"}})
+    await _maybe_delay(model)
     try:
         content = _chat_content(body)
     except SchemaResolutionError as exc:
@@ -361,6 +377,8 @@ async def reset():
     last_request.clear()
     request_log.clear()
     fail_mode.clear()
+    delay_mode.clear()
+    request_counts.clear()
     return {"ok": True}
 
 
@@ -379,6 +397,7 @@ async def set_fail_mode(request: Request):
             content={"error": {"message": "failmode body must be a JSON object", "type": "invalid_request_error", "code": "invalid_failmode"}},
         )
     model, status = spec.get("model"), spec.get("status")
+    timeout_ms, timeout_every = spec.get("timeout_ms"), spec.get("timeout_every")
     if not isinstance(model, str) or not model.strip():
         return JSONResponse(
             status_code=400,
@@ -389,13 +408,34 @@ async def set_fail_mode(request: Request):
             status_code=400,
             content={"error": {"message": "failmode.status must be an integer HTTP status from 100 to 599", "type": "invalid_request_error", "code": "invalid_failmode"}},
         )
-    if status is None:
+    if timeout_ms is not None and (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 0 <= timeout_ms <= 120000):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode.timeout_ms must be an integer from 0 to 120000", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
+    if timeout_every is not None and (isinstance(timeout_every, bool) or not isinstance(timeout_every, int) or timeout_every < 1):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode.timeout_every must be a positive integer", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
+    if (timeout_ms is None) != (timeout_every is None):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "failmode.timeout_ms and timeout_every must be provided together", "type": "invalid_request_error", "code": "invalid_failmode"}},
+        )
+    if status is None and timeout_ms is None:
         fail_mode.pop(model, None)
+        delay_mode.pop(model, None)
+        request_counts.pop(model, None)
     else:
-        fail_mode[model] = status
-    return {"ok": True, "fail_mode": dict(fail_mode)}
+        if status is not None:
+            fail_mode[model] = status
+        if timeout_ms is not None:
+            delay_mode[model] = {"timeout_ms": timeout_ms, "timeout_every": timeout_every}
+            request_counts[model] = 0
+    return {"ok": True, "fail_mode": dict(fail_mode), "delay_mode": dict(delay_mode)}
 
 
 @app.get("/failmode")
 async def get_fail_mode():
-    return {"fail_mode": dict(fail_mode)}
+    return {"fail_mode": dict(fail_mode), "delay_mode": dict(delay_mode)}
