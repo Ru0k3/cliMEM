@@ -119,6 +119,121 @@ class MockProviderConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(response.status_code == 200 for response in recovered))
 
+    async def test_embedding_timeouts_are_bounded_and_recover(self):
+        configured = await self.client.post(
+            "/failmode",
+            json={"model": "embed-flaky", "timeout_ms": 50, "timeout_every": 2},
+        )
+        self.assertEqual(configured.status_code, 200)
+
+        async def embedding_with_deadline(index: int):
+            try:
+                return await asyncio.wait_for(
+                    self.client.post(
+                        "/v1/embeddings",
+                        json={"model": "embed-flaky", "input": [f"embedding-{index}"]},
+                    ),
+                    timeout=0.01,
+                )
+            except asyncio.TimeoutError:
+                return "timeout"
+
+        results = await asyncio.gather(*(embedding_with_deadline(index) for index in range(30)))
+        self.assertGreaterEqual(results.count("timeout"), 1)
+        self.assertTrue(all(result == "timeout" or result.status_code == 200 for result in results))
+
+        cleared = await self.client.post("/failmode", json={"model": "embed-flaky"})
+        self.assertEqual(cleared.status_code, 200)
+        recovered = await self.client.post(
+            "/v1/embeddings",
+            json={"model": "embed-flaky", "input": ["recovered"]},
+        )
+        self.assertEqual(recovered.status_code, 200)
+
+    async def test_failmode_updates_are_safe_during_active_requests(self):
+        configured = await self.client.post(
+            "/failmode",
+            json={"model": "active", "timeout_ms": 40, "timeout_every": 1},
+        )
+        self.assertEqual(configured.status_code, 200)
+
+        async def active_request(index: int):
+            return await self.client.post(
+                "/v1/chat/completions",
+                json={"model": "active", "messages": [{"role": "user", "content": str(index)}]},
+            )
+
+        requests = [asyncio.create_task(active_request(index)) for index in range(30)]
+        updates = [
+            self.client.post(
+                "/failmode",
+                json=(
+                    {"model": "active", "timeout_ms": 20, "timeout_every": 2}
+                    if index % 2
+                    else {"model": "active", "status": 503}
+                ),
+            )
+            for index in range(12)
+        ]
+        update_results = await asyncio.gather(*updates)
+        request_results = await asyncio.gather(*requests)
+        self.assertTrue(all(response.status_code == 200 for response in update_results))
+        self.assertTrue(all(response.status_code in {200, 503} for response in request_results))
+        cleared = await self.client.post("/failmode", json={"model": "active"})
+        self.assertEqual(cleared.status_code, 200)
+
+    async def test_request_log_reads_and_writes_are_safe_concurrently(self):
+        async def writer(index: int):
+            return await self.client.post(
+                "/v1/chat/completions",
+                json={"model": "writer", "messages": [{"role": "user", "content": f"secret-{index}"}]},
+            )
+
+        async def reader():
+            return await self.client.get("/request-log")
+
+        results = await asyncio.gather(
+            *(writer(index) for index in range(150)),
+            *(reader() for _ in range(75)),
+        )
+        writes = results[:150]
+        reads = results[150:]
+        self.assertTrue(all(response.status_code == 200 for response in writes))
+        self.assertTrue(all(response.status_code == 200 for response in reads))
+        self.assertTrue(all(response.json()["count"] <= MAX_REQUEST_LOG for response in reads))
+        final_log = (await self.client.get("/request-log")).json()
+        self.assertLessEqual(final_log["count"], MAX_REQUEST_LOG)
+        self.assertNotIn("secret-", repr(final_log))
+
+    async def test_streamed_response_can_be_cancelled_after_first_chunk(self):
+        from starlette.requests import Request
+        from starlette.responses import StreamingResponse
+        from test.mock_provider import chat_completions
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "scheme": "http",
+            "http_version": "1.1",
+        }
+        body = b'{"model":"cancel","stream":true,"messages":[]}'
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(scope, receive=receive)
+        response = await chat_completions(request)
+        self.assertIsInstance(response, StreamingResponse)
+        first_chunk = await anext(response.body_iterator)
+        self.assertIn("data:", first_chunk)
+        await response.body_iterator.aclose()
+
     async def test_concurrent_failure_mode_recovers_without_stale_failures(self):
         failure = await self.client.post("/failmode", json={"model": "unstable", "status": 503})
         self.assertEqual(failure.status_code, 200)
